@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Farming Content Node</title>
+<style>
+:root {
+  --bg: #f3f5f2; --card: #ffffff; --ink: #17211b; --muted: #66736b; --line: #e2e7e1; --soft: #f6f8f5;
+  --green: #1f8a4c; --green-soft: #e3f3e8; --amber: #b96f00; --amber-soft: #fff1d6; --red: #c43d2f;
+  --red-soft: #fde6e2; --blue: #2563a8; --blue-soft: #e3eefb; --violet: #6b4fb3; --violet-soft: #eee8fa;
+  --shadow: 0 1px 2px rgba(20, 40, 25, .06), 0 8px 24px rgba(20, 40, 25, .06);
+  --radius: 16px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.4 "Ubuntu", "Inter", "Segoe UI", system-ui, sans-serif; }
+header { display: flex; align-items: center; gap: 18px; padding: 16px 28px; background: #12301f; color: #eef6f0;
+  flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 12px; margin-right: auto; }
+.brand svg { width: 34px; height: 34px; }
+.brand h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: .2px; }
+.brand p { margin: 0; font-size: 13px; color: #a9c7b3; }
+.chip { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px; border-radius: 999px;
+  background: rgba(255,255,255,.08); font-size: 13px; color: #d9eadf; white-space: nowrap; }
+.chip b { color: #fff; font-weight: 600; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #7f8c84; display: inline-block; }
+.dot.on { background: #4ade80; box-shadow: 0 0 0 3px rgba(74, 222, 128, .2); }
+.target { display: flex; gap: 6px; align-items: center; }
+.target input { width: 132px; padding: 7px 10px; border-radius: 10px; border: 1px solid #3c5a47; background: #0d2416;
+  color: #fff; font: inherit; font-size: 14px; }
+.target button { padding: 7px 12px; border-radius: 10px; border: 0; background: #2f7d4f; color: #fff; font: inherit;
+  font-size: 13px; cursor: pointer; }
+main { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) 340px; gap: 18px; padding: 20px 28px 28px; }
+@media (max-width: 1500px) { main { grid-template-columns: repeat(3, minmax(0, 1fr)); } aside { grid-column: 1 / -1;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 18px; } }
+@media (max-width: 1050px) { main { grid-template-columns: 1fr; padding: 16px; } aside { grid-template-columns: 1fr; } }
+.card { background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px 18px 16px;
+  display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.head { display: flex; align-items: center; gap: 12px; }
+.icon { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; flex: none; }
+.icon svg { width: 24px; height: 24px; }
+.head h2 { margin: 0; font-size: 18px; font-weight: 600; }
+.head .sub { font-size: 12.5px; color: var(--muted); }
+.grow { flex: 1; min-width: 0; }
+.pill { font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px; background: var(--soft);
+  color: var(--muted); white-space: nowrap; }
+.pill.run { background: var(--green-soft); color: var(--green); }
+.pill.wait { background: var(--amber-soft); color: var(--amber); }
+.pill.err { background: var(--red-soft); color: var(--red); }
+.btn { border: 0; border-radius: 11px; padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer;
+  background: var(--green); color: #fff; white-space: nowrap; }
+.btn.stop { background: #fff; color: var(--red); box-shadow: inset 0 0 0 1.5px #efc2bb; }
+.btn.ghost { background: var(--soft); color: var(--ink); font-weight: 500; box-shadow: inset 0 0 0 1px var(--line); }
+.btn:disabled { opacity: .5; cursor: default; }
+.states { display: grid; grid-template-columns: repeat(var(--n), 1fr); gap: 8px; }
+.state { border: 1.5px solid var(--line); background: var(--soft); border-radius: 14px; padding: 12px 8px 10px;
+  cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 6px; font: inherit;
+  font-weight: 600; color: var(--muted); transition: background .15s, border-color .15s, color .15s; }
+.state svg { width: 30px; height: 30px; }
+.state:hover { border-color: #c9d3c8; color: var(--ink); }
+.state.active { color: var(--c); border-color: var(--c); background: var(--cs); box-shadow: 0 0 0 3px var(--cs); }
+.state small { font-weight: 400; font-size: 11.5px; color: var(--muted); }
+.preview { background: var(--soft); border-radius: 14px; padding: 12px; min-height: 120px; position: relative; }
+.tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.tile { background: #fff; border-radius: 11px; padding: 9px 10px; border: 1px solid var(--line); min-width: 0; }
+.tile .k { font-size: 11.5px; color: var(--muted); display: flex; align-items: center; gap: 5px; }
+.tile .k svg { width: 14px; height: 14px; flex: none; }
+.tile .v { font-size: 20px; font-weight: 600; margin-top: 2px; white-space: nowrap; }
+.tile .v small { font-size: 12px; color: var(--muted); font-weight: 500; margin-left: 2px; }
+.tile.bad { border-color: #f1b8ae; background: #fff7f5; }
+.tile.bad .v { color: var(--red); }
+.bar { height: 5px; border-radius: 3px; background: #e7ece6; margin-top: 6px; position: relative; overflow: hidden; }
+.bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--blue); border-radius: 3px;
+  transition: width .5s; }
+.bar b { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--red); }
+.alerts { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.alert { display: flex; gap: 8px; align-items: center; padding: 8px 10px; border-radius: 10px; font-size: 13px;
+  background: var(--amber-soft); color: #7a4a00; }
+.alert.critical { background: var(--red-soft); color: #8d2a1f; }
+.alert svg { width: 16px; height: 16px; flex: none; }
+.ok { font-size: 13px; color: var(--green); display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+.irrig { display: flex; align-items: center; gap: 14px; background: #fff; border: 1px solid var(--line);
+  border-radius: 12px; padding: 10px 12px; margin-top: 10px; }
+.irrig.on { border-color: #9cc9f2; background: #f4f9ff; }
+.ring { width: 58px; height: 58px; flex: none; position: relative; }
+.ring svg { width: 58px; height: 58px; transform: rotate(-90deg); }
+.ring span { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 700; font-size: 14px;
+  color: var(--blue); }
+.irrig .t { font-weight: 600; }
+.irrig .s { font-size: 12.5px; color: var(--muted); }
+.media { position: relative; border-radius: 11px; overflow: hidden; background: #dfe5dd; aspect-ratio: 4 / 3; }
+.media.video { aspect-ratio: 16 / 9; background: #0e1a12; }
+.media img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.media [hidden] { display: none !important; }
+.media .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
+  font-size: 13px; text-align: center; padding: 20px; }
+.media.video .empty { color: #8fa597; }
+.zone { position: absolute; border: 2px solid #ffb020; border-radius: 4px; box-shadow: 0 0 0 1px rgba(0,0,0,.25); }
+.zone span { position: absolute; left: -2px; top: -20px; background: #ffb020; color: #2b1a00; font-size: 10.5px;
+  font-weight: 700; padding: 1px 5px; border-radius: 4px; white-space: nowrap; }
+.overlay { position: absolute; left: 10px; top: 10px; display: flex; gap: 6px; }
+.tag { background: rgba(10, 22, 14, .72); color: #fff; font-size: 11.5px; padding: 3px 8px; border-radius: 6px;
+  font-weight: 600; }
+.tag.alert { background: rgba(190, 60, 30, .9); }
+.seg { display: inline-flex; background: #fff; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.seg button { border: 0; background: transparent; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  color: var(--muted); }
+.seg button.on { background: var(--ink); color: #fff; }
+.meta { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 9px;
+  font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+.meta b { color: var(--ink); font-weight: 600; }
+.progress { height: 6px; border-radius: 3px; background: #e3e9e2; overflow: hidden; margin-top: 8px; }
+.progress i { display: block; height: 100%; background: var(--violet); width: 0; transition: width .4s; }
+.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.metric { border-top: 1px solid var(--line); padding-top: 9px; min-width: 0; }
+.metric .k { font-size: 11.5px; color: var(--muted); }
+.metric .v { font-size: 16px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.foot { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px;
+  flex-wrap: wrap; }
+.foot code { font-size: 11.5px; }
+aside { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+aside h3 { margin: 0; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.feed { display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow: auto; }
+.cmd { display: flex; gap: 10px; align-items: flex-start; padding: 10px; border-radius: 12px; background: var(--soft); }
+.cmd .ic { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; flex: none; }
+.cmd .ic svg { width: 17px; height: 17px; }
+.cmd .tx { font-size: 13.5px; font-weight: 600; }
+.cmd .tm { font-size: 11.5px; color: var(--muted); }
+.cmd.fail .tx { color: var(--red); }
+.cmd.fresh { animation: flash 1.6s ease-out; }
+@keyframes flash { from { background: #dff3e6; } to { background: var(--soft); } }
+.log { font: 12px/1.45 "Ubuntu Mono", ui-monospace, monospace; color: #3d4a42; max-height: 300px; overflow: auto;
+  display: flex; flex-direction: column; gap: 3px; }
+.log span { color: var(--muted); margin-right: 6px; }
+.none { font-size: 13px; color: var(--muted); }
+.wx { --c: var(--blue); --cs: var(--blue-soft); }
+.cr { --c: var(--violet); --cs: var(--violet-soft); }
+.dr { --c: var(--green); --cs: var(--green-soft); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="11" fill="#2f7d4f"/>
+      <path d="M12 27c0-9 6-15 17-15-1 10-6 16-15 16" stroke="#eaffef" stroke-width="2.4" stroke-linecap="round"/>
+      <path d="M12 29c3-5 7-9 12-11" stroke="#eaffef" stroke-width="2.4" stroke-linecap="round"/></svg>
+    <div><h1>Smart Farming · Content Node</h1>
+      <p>UN3GPP UE (PC3) → N3IWF → 5G core → phone · contract v1</p></div>
+  </div>
+  <span class="chip">UE address <b id="ue">–</b></span>
+  <span class="chip"><span class="dot" id="ctl-dot"></span>Control <b id="ctl">tcp/47010</b></span>
+  <span class="chip">Collector <b id="coll">–</b></span>
+  <div class="target"><span class="chip">Phone</span><input id="target" spellcheck="false" placeholder="from the first app request">
+    <button id="target-set">Apply</button></div>
+</header>
+
+<main>
+  <!-- weather -->
+  <section class="card wx" id="card-weather">
+    <div class="head">
+      <div class="icon" style="background:var(--blue-soft);color:var(--blue)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 18h9a4 4 0 0 0 .5-8 5.5 5.5 0 0 0-10.6 1.5A3.3 3.3 0 0 0 7 18Z"/></svg></div>
+      <div class="grow"><h2>Weather station</h2><div class="sub">UDP <span class="port" data-p="weather">47001</span> · 10 readings/s × 1250 B</div></div>
+      <span class="pill" data-pill="weather">Stopped</span>
+      <button class="btn" data-run="weather">Start</button>
+    </div>
+    <div class="states" style="--n:3" data-states="weather"></div>
+    <div class="preview">
+      <div class="tiles" id="wx-tiles"></div>
+      <div id="wx-alerts"></div>
+      <div class="irrig" id="irrig">
+        <div class="ring"><svg viewBox="0 0 58 58"><circle cx="29" cy="29" r="25" stroke="#e1e8e0" stroke-width="6" fill="none"/>
+          <circle id="ring-arc" cx="29" cy="29" r="25" stroke="#2563a8" stroke-width="6" fill="none" stroke-linecap="round"
+            stroke-dasharray="157.1" stroke-dashoffset="157.1"/></svg><span id="ring-txt">–</span></div>
+        <div class="grow"><div class="t" id="irrig-t">Irrigation off</div><div class="s" id="irrig-s">Waiting for a command from the phone</div></div>
+        <button class="btn ghost" id="irrig-test" title="Local test: same effect as the phone command">Test 60 s</button>
+      </div>
+    </div>
+    <div class="metrics" data-metrics="weather"></div>
+    <div class="foot" data-foot="weather"></div>
+  </section>
+
+  <!-- crop -->
+  <section class="card cr" id="card-crop">
+    <div class="head">
+      <div class="icon" style="background:var(--violet-soft);color:var(--violet)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m3 16 5-5 4 4 3-3 6 6"/><circle cx="16" cy="9" r="1.6"/></svg></div>
+      <div class="grow"><h2>Crop imaging</h2><div class="sub">TCP <span class="port" data-p="crop">47002</span> · 25 MiB multispectral captures · 20 Mbit/s</div></div>
+      <span class="pill" data-pill="crop">Stopped</span>
+      <button class="btn" data-run="crop">Start</button>
+    </div>
+    <div class="states" style="--n:3" data-states="crop"></div>
+    <div class="preview">
+      <div class="media" id="crop-media"><div class="empty" id="crop-empty">The latest capture appears here once a
+        crop object is being sent.</div><img id="crop-img" alt="" hidden><div id="crop-zones"></div>
+        <div class="overlay"><span class="tag" id="crop-tag" hidden></span></div></div>
+      <div class="meta"><span id="crop-id">–</span>
+        <span class="seg"><button class="on" data-view="rgb">RGB</button><button data-view="ndvi">NDVI</button></span></div>
+      <div class="meta"><span>NDVI mean <b id="crop-ndvi">–</b></span><span>Zones <b id="crop-zn">–</b></span>
+        <span>Transfer <b id="crop-pct">–</b></span></div>
+      <div class="progress"><i id="crop-prog"></i></div>
+    </div>
+    <div class="metrics" data-metrics="crop"></div>
+    <div class="foot" data-foot="crop"></div>
+  </section>
+
+  <!-- drone -->
+  <section class="card dr" id="card-drone">
+    <div class="head">
+      <div class="icon" style="background:var(--green-soft);color:var(--green)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="5.5" cy="5.5" r="2.5"/><circle cx="18.5" cy="5.5" r="2.5"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/><path d="m7.5 7.5 3 3m6-3-3 3m-6 6 3-3m6 3-3-3"/><rect x="9.5" y="9.5" width="5" height="5" rx="1.2"/></svg></div>
+      <div class="grow"><h2>Drone video</h2><div class="sub">UDP <span class="port" data-p="drone">47003</span> · MJPEG 1080p30 · 40 Mbit/s CBR</div></div>
+      <span class="pill" data-pill="drone">Stopped</span>
+      <button class="btn" data-run="drone">Start</button>
+    </div>
+    <div class="states" style="--n:2" data-states="drone"></div>
+    <div class="preview">
+      <div class="media video"><div class="empty" id="dr-empty">Current frame of the loop being sent.</div>
+        <img id="dr-img" alt="" hidden><div class="overlay"><span class="tag" id="dr-tag">NORMAL</span>
+        <span class="tag" id="dr-switch" hidden></span></div></div>
+      <div class="meta"><span>Frame <b id="dr-frame">–</b></span><span>Loop <b id="dr-loop">–</b></span>
+        <span>Fillers <b id="dr-fill">–</b></span></div>
+    </div>
+    <div class="metrics" data-metrics="drone"></div>
+    <div class="foot" data-foot="drone"></div>
+  </section>
+
+  <aside>
+    <section class="card">
+      <h3><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>Control commands · phone and panel</h3>
+      <div class="feed" id="feed"><div class="none">No command received yet.</div></div>
+    </section>
+    <section class="card">
+      <h3>Events</h3>
+      <div class="log" id="log"></div>
+    </section>
+  </aside>
+</main>
+
+<script>
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const ICON = {
+  stable: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.5 1.5M17.2 17.2l1.5 1.5M5.3 18.7l1.5-1.5M17.2 6.8l1.5-1.5"/></svg>',
+  drought: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5c3 4 5.5 7 5.5 10a5.5 5.5 0 0 1-11 0c0-3 2.5-6 5.5-10Z"/><path d="M4 21l16-16"/></svg>',
+  storm: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 15h9a4 4 0 0 0 .5-8 5.5 5.5 0 0 0-10.6 1.5A3.3 3.3 0 0 0 7 15Z"/><path d="m12.5 13-2.5 4h3l-2 4"/></svg>',
+  healthy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 19c0-8 5-13 14-13-1 8-5 13-12.5 13"/><path d="M6 21c2.5-4.5 6-8 10-10"/></svg>',
+  pest: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><ellipse cx="12" cy="13.5" rx="4.5" ry="6"/><path d="M12 7.5V19.5M9 5l1.5 2.5M15 5l-1.5 2.5M7.5 11H4.5M19.5 11h-3M7.5 15.5H4.5M19.5 15.5h-3"/></svg>',
+  water_stress: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21v-8"/><path d="M12 13c-4 0-6.5-2.5-6.5-6 3.5 0 6.5 2 6.5 6Z"/><path d="M12 15.5c2.6 0 4.5-2 4.5-4.5-2.6 0-4.5 2-4.5 4.5Z"/><path d="M18.5 4.5c.9 1.2 1.6 2.1 1.6 3a1.6 1.6 0 0 1-3.2 0c0-.9.7-1.8 1.6-3Z"/></svg>',
+  normal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3"/></svg>',
+  alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 4.2 2.6 17.5A2 2 0 0 0 4.3 20.5h15.4a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0Z"/><path d="M12 9.5v4.5M12 17.2v.1"/></svg>',
+};
+const LABEL = { stable: ["Stable", "normal conditions"], drought: ["Drought", "dry soil, low humidity"],
+  storm: ["Storm", "heavy rain, wind"], healthy: ["Healthy", "uniform canopy"], pest: ["Pest", "hotspot patches"],
+  water_stress: ["Water stress", "low-NDVI region"], normal: ["Normal", "routine flight"],
+  alert: ["Alert", "anomaly highlighted"] };
+const COLORS = { stable: ["var(--green)", "var(--green-soft)"], drought: ["var(--amber)", "var(--amber-soft)"],
+  storm: ["var(--blue)", "var(--blue-soft)"], healthy: ["var(--green)", "var(--green-soft)"],
+  pest: ["var(--red)", "var(--red-soft)"], water_stress: ["var(--amber)", "var(--amber-soft)"],
+  normal: ["var(--green)", "var(--green-soft)"], alert: ["var(--red)", "var(--red-soft)"] };
+const TILE_ICON = {
+  t: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 14.8V4.5a2 2 0 0 0-4 0v10.3a4 4 0 1 0 4 0Z"/></svg>',
+  h: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3.5c3 4 5.5 7 5.5 10a5.5 5.5 0 0 1-11 0c0-3 2.5-6 5.5-10Z"/></svg>',
+  s: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 15h18M5 19h14M12 3v8M9 8l3 3 3-3"/></svg>',
+  r: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 13h9a4 4 0 0 0 .5-8A5.5 5.5 0 0 0 6 6.5 3.3 3.3 0 0 0 7 13ZM8 16l-1 3M12 16l-1 3M16 16l-1 3"/></svg>',
+  w: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 8h11a3 3 0 1 0-3-3M3 12h16a3 3 0 1 1-3 3M3 16h7"/></svg>',
+  sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2"/></svg>',
+  p: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="13" r="8"/><path d="m12 13 4-4"/></svg>',
+  l: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 19c0-8 5-13 14-13-1 8-5 13-12.5 13"/></svg>',
+};
+const SRC_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>';
+const DROP_ICON = TILE_ICON.h;
+
+let S = null, cropView = "rgb", lastCropAt = 0, lastFeedTop = 0, busy = {};
+
+function post(path, body) {
+  return fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+    .then(r => r.json()).catch(() => ({}));
+}
+function fmtRate(bps) {
+  if (!bps) return "0";
+  if (bps >= 1e6) return (bps / 1e6).toFixed(bps >= 1e7 ? 1 : 2) + " Mbit/s";
+  return (bps / 1e3).toFixed(0) + " kbit/s";
+}
+function fmtBytes(b) {
+  if (b == null) return "–";
+  if (b >= 1e9) return (b / 1e9).toFixed(2) + " GB";
+  if (b >= 1e6) return (b / 1e6).toFixed(1) + " MB";
+  return (b / 1e3).toFixed(0) + " kB";
+}
+function fmtInt(n) { return n == null ? "–" : Number(n).toLocaleString("en-US"); }
+function ago(t) {
+  const s = Math.max(0, Math.round(S.now - t));
+  return s < 60 ? s + " s ago" : s < 3600 ? Math.round(s / 60) + " min ago" : new Date(t * 1000).toLocaleTimeString();
+}
+function clock(t) { return new Date(t * 1000).toLocaleTimeString([], { hour12: false }); }
+
+function buildStates() {
+  document.querySelectorAll("[data-states]").forEach(box => {
+    const service = box.dataset.states;
+    const opts = { weather: ["stable", "drought", "storm"], crop: ["healthy", "pest", "water_stress"],
+      drone: ["normal", "alert"] }[service];
+    box.innerHTML = opts.map(o => `<button class="state" data-service="${service}" data-state="${o}"
+      style="--c:${COLORS[o][0]};--cs:${COLORS[o][1]}">${ICON[o]}${LABEL[o][0]}<small>${LABEL[o][1]}</small></button>`).join("");
+  });
+  document.querySelectorAll(".state").forEach(b => b.addEventListener("click", () => {
+    post("/api/state", { service: b.dataset.service, state: b.dataset.state }).then(refresh);
+  }));
+  document.querySelectorAll("[data-run]").forEach(b => b.addEventListener("click", () => {
+    const service = b.dataset.run, running = S && S.services[service].running;
+    busy[service] = Date.now();
+    b.disabled = true;
+    post(running ? "/api/stop" : "/api/start", { service, target: $("#target").value.trim() || undefined })
+      .then(() => setTimeout(refresh, 300));
+  }));
+  document.querySelectorAll("[data-view]").forEach(b => b.addEventListener("click", () => {
+    cropView = b.dataset.view;
+    document.querySelectorAll("[data-view]").forEach(x => x.classList.toggle("on", x === b));
+    lastCropAt = 0;
+    renderCrop();
+  }));
+  $("#target-set").addEventListener("click", () => post("/api/target", { target: $("#target").value.trim() }).then(refresh));
+  $("#irrig-test").addEventListener("click", () => post("/api/irrigation", { duration_s: 60 }).then(refresh));
+}
+
+function tile(icon, key, value, unit, opts = {}) {
+  const bar = opts.bar ? `<div class="bar"><i style="width:${Math.min(100, opts.bar[0] / opts.bar[1] * 100)}%"></i>
+    ${opts.bar[2] != null ? `<b style="left:${opts.bar[2] / opts.bar[1] * 100}%"></b>` : ""}</div>` : "";
+  return `<div class="tile ${opts.bad ? "bad" : ""}"><div class="k">${TILE_ICON[icon]}${key}</div>
+    <div class="v">${value}<small>${unit}</small></div>${bar}</div>`;
+}
+function compass(deg) { return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(deg / 45) % 8]; }
+
+function renderWeather() {
+  const w = S.weather, r = w.readings, th = w.thresholds, ids = new Set(w.alerts.map(a => a.id));
+  $("#wx-tiles").innerHTML = [
+    tile("t", "Air temperature", r.air_temperature_c.toFixed(1), "°C"),
+    tile("h", "Air humidity", r.air_humidity_pct, "%", { bad: ids.has("low_humidity"), bar: [r.air_humidity_pct, 100, th.air_humidity_pct.min] }),
+    tile("s", "Soil moisture", r.soil_moisture_pct.toFixed(1), "%", { bad: ids.has("dry_soil"), bar: [r.soil_moisture_pct, 60, th.soil_moisture_pct.min] }),
+    tile("r", "Rain rate", r.rain_rate_mm_h.toFixed(1), "mm/h", { bad: ids.has("excess_rain"), bar: [r.rain_rate_mm_h, 60, th.rain_rate_mm_h.max] }),
+    tile("w", "Wind", r.wind_speed_kmh.toFixed(1), `km/h ${compass(r.wind_direction_deg)}`),
+    tile("sun", "Solar · UV", r.solar_radiation_w_m2, `W/m² · UV ${r.uv_index.toFixed(1)}`),
+    tile("p", "Pressure", r.pressure_hpa.toFixed(1), "hPa"),
+    tile("r", "Rain today", r.rain_today_mm.toFixed(1), "mm"),
+    tile("l", "Leaf wetness", r.leaf_wetness_pct, "%"),
+  ].join("");
+  $("#wx-alerts").innerHTML = w.alerts.length
+    ? `<div class="alerts">${w.alerts.map(a => `<div class="alert ${a.severity}">${ICON.alert}<span>${a.text}${a.action ? ` <b>· action: ${a.action}</b>` : ""}</span></div>`).join("")}</div>`
+    : `<div class="ok">${ICON.stable.replace('<svg', '<svg width="16" height="16"')}All readings within thresholds</div>`;
+  const irr = S.irrigation, box = $("#irrig");
+  box.classList.toggle("on", irr.active);
+  const frac = irr.active && irr.duration_s ? irr.remaining_s / irr.duration_s : 0;
+  $("#ring-arc").setAttribute("stroke-dashoffset", (157.1 * (1 - frac)).toFixed(1));
+  $("#ring-txt").textContent = irr.active ? irr.remaining_s + " s" : "off";
+  const last = S.commands.find(c => c.ok && c.request && c.request.cmd === "irrigation");
+  $("#irrig-t").textContent = irr.active ? `Irrigating · ${irr.remaining_s} s left` : "Irrigation off";
+  $("#irrig-s").textContent = last ? `${last.text} · ${ago(last.at)}` : "Waiting for a command from the phone";
+}
+
+function renderCrop() {
+  const c = S.services.crop, meta = c.preview, st = c.status || {};
+  if (meta && (c.preview_at !== lastCropAt)) {
+    lastCropAt = c.preview_at;
+    const img = $("#crop-img");
+    img.src = `/api/crop/${cropView}.jpg?t=${c.preview_at}`;
+    img.hidden = false;
+    $("#crop-empty").hidden = true;
+    $("#crop-zones").innerHTML = meta.zones.map(z => `<div class="zone" style="left:${z.x * 100}%;top:${z.y * 100}%;
+      width:${z.w * 100}%;height:${z.h * 100}%"><span>${z.label} · ${z.severity}</span></div>`).join("");
+    const tag = $("#crop-tag");
+    tag.hidden = false;
+    tag.textContent = LABEL[meta.state][0].toUpperCase();
+    tag.classList.toggle("alert", meta.state !== "healthy");
+  }
+  if (meta) {
+    $("#crop-id").innerHTML = `<b>${meta.capture_id}</b>`;
+    $("#crop-ndvi").textContent = meta.ndvi_mean.toFixed(2);
+    $("#crop-zn").textContent = meta.zones.length;
+  }
+  const pct = st.object_size ? Math.round(100 * st.object_progress / st.object_size) : 0;
+  $("#crop-prog").style.width = (c.running ? pct : 0) + "%";
+  $("#crop-pct").textContent = c.running ? (st.phase === "connecting" ? "connecting…" : pct + " %") : "–";
+}
+
+function renderDrone() {
+  const d = S.services.drone, st = d.status || {};
+  const img = $("#dr-img");
+  img.onerror = () => { img.hidden = true; $("#dr-empty").hidden = false; };
+  img.onload = () => { img.hidden = false; $("#dr-empty").hidden = true; };
+  img.src = `/api/drone/frame.jpg?t=${Date.now()}`;
+  const variant = st.variant || S.states.drone, desired = S.states.drone;
+  const tag = $("#dr-tag");
+  tag.textContent = variant.toUpperCase();
+  tag.classList.toggle("alert", variant === "alert");
+  const sw = $("#dr-switch");
+  if (d.running && desired !== variant && st.loop_frames) {
+    const left = ((st.loop_frames - st.loop_index) / (st.fps || 30)).toFixed(1);
+    sw.hidden = false;
+    sw.textContent = `→ ${desired.toUpperCase()} at loop end · ${left} s`;
+  } else sw.hidden = true;
+  $("#dr-frame").textContent = st.loop_frames ? `${st.loop_index + 1} / ${st.loop_frames}` : "–";
+  $("#dr-loop").textContent = st.loops != null ? st.loops + 1 : "–";
+  $("#dr-fill").textContent = st.sent_packets ? (100 * st.filler_packets / st.sent_packets).toFixed(1) + " %" : "–";
+}
+
+function renderService(service) {
+  const s = S.services[service], st = s.status || {};
+  const pill = $(`[data-pill="${service}"]`), btn = $(`[data-run="${service}"]`);
+  let text = "Stopped", cls = "";
+  if (s.running) {
+    if (st.phase === "warmup") { text = "Starting"; cls = "wait"; }
+    else if (st.phase === "connecting") { text = "Connecting"; cls = "wait"; }
+    else { text = "Running"; cls = "run"; }
+  } else if (s.last_error) { text = "Error"; cls = "err"; }
+  pill.textContent = text;
+  pill.className = "pill " + cls;
+  if (!busy[service] || Date.now() - busy[service] > 1200) btn.disabled = false;
+  btn.textContent = s.running ? "Stop" : "Start";
+  btn.classList.toggle("stop", s.running);
+  document.querySelectorAll(`.state[data-service="${service}"]`).forEach(b =>
+    b.classList.toggle("active", b.dataset.state === S.states[service]));
+  const m = [];
+  m.push(["Rate", s.running ? fmtRate(s.rate_bps) : "–"]);
+  if (service === "crop") {
+    m.push(["Objects", fmtInt(st.sent_objects)], ["Sent", fmtBytes(st.sent_bytes)], ["Aborted", fmtInt(st.aborted_objects)]);
+  } else if (service === "drone") {
+    m.push(["Packets", fmtInt(st.sent_packets)], ["Frames", fmtInt(st.frames_sent)], ["Skipped", st.frames_sent == null ? "–" : fmtInt((st.frames_skipped || 0) + (st.frames_late || 0))]);
+  } else {
+    m.push(["Packets/s", s.running ? s.pps.toFixed(1) : "–"], ["Packets", fmtInt(st.sent_packets)], ["Sent", fmtBytes(st.sent_bytes)]);
+  }
+  $(`[data-metrics="${service}"]`).innerHTML = m.map(([k, v]) => `<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+  let foot = "";
+  if (s.running) foot = `<span>→ ${s.target} · ${s.origin} run <code>${s.run_id.slice(0, 8)}</code></span><span>since ${clock(s.started_at)}</span>`;
+  else if (s.last_error) foot = `<span style="color:var(--red)">${s.last_error}</span>`;
+  else if (s.last_summary) foot = `<span>Last run <code>${s.last_summary.run_id.slice(0, 8)}</code>: ${fmtBytes(s.last_summary.sent_bytes)} in ${s.last_summary.elapsed_s} s</span><span>offered ${fmtRate(s.last_summary.offered_bps)}</span>`;
+  else foot = `<span>Idle · target ${S.target}</span>`;
+  $(`[data-foot="${service}"]`).innerHTML = foot;
+}
+
+function renderFeed() {
+  const feed = $("#feed");
+  if (!S.commands.length) { feed.innerHTML = '<div class="none">No command received yet.</div>'; return; }
+  const top = S.commands[0].at;
+  feed.innerHTML = S.commands.map((c, i) => {
+    const irrigation = c.request && c.request.cmd === "irrigation";
+    const bg = !c.ok ? "var(--red-soft);color:var(--red)" : irrigation ? "var(--blue-soft);color:var(--blue)" : "var(--green-soft);color:var(--green)";
+    return `<div class="cmd ${c.ok ? "" : "fail"} ${i === 0 && top !== lastFeedTop && lastFeedTop ? "fresh" : ""}">
+      <div class="ic" style="background:${bg}">${irrigation ? DROP_ICON : SRC_ICON}</div>
+      <div><div class="tx">${c.text}</div><div class="tm">${clock(c.at)} · ${c.source} ${c.peer} · ${c.detail}</div></div></div>`;
+  }).join("");
+  lastFeedTop = top;
+}
+
+function render() {
+  $("#ue").textContent = S.ue_address || "–";
+  $("#ctl").textContent = `tcp/${S.ports.control}` + (S.control.clients ? ` · ${S.control.clients} phone` : "");
+  $("#ctl-dot").classList.toggle("on", S.control.listening);
+  $("#coll").textContent = S.report ? S.report.replace(/^https?:\/\//, "") : "off";
+  document.querySelectorAll(".port").forEach(p => p.textContent = S.ports[p.dataset.p]);
+  const t = $("#target");
+  if (document.activeElement !== t && !t.value) t.value = S.target;
+  ["weather", "crop", "drone"].forEach(renderService);
+  renderWeather();
+  renderCrop();
+  renderDrone();
+  renderFeed();
+  $("#log").innerHTML = S.events.map(e => `<div><span>${clock(e.at)}</span>${e.text}</div>`).join("");
+}
+
+function refresh() {
+  return fetch("/api/status", { cache: "no-store" }).then(r => r.json()).then(s => { S = s; render(); })
+    .catch(() => { $("#ctl-dot").classList.remove("on"); });
+}
+buildStates();
+/*__INITIAL__*/
+if (window.INITIAL) { S = window.INITIAL; render(); } else refresh();
+setInterval(refresh, 800);
+</script>
+</body>
+</html>

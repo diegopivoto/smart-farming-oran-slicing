@@ -1,0 +1,7 @@
+schema_version: 1
+oai_commit: f8f769592a7030be88ede4bb5ca66fa1ca6a80e0
+flexric_commit: d7a71285f3720fbc1487e9a86309eec5fb61a408
+e2ap: E2AP_V2
+kpm: KPM_V2_03
+sm_dir: /usr/local/lib/flexric
+near_ric_ip_addr: 192.168.56.101

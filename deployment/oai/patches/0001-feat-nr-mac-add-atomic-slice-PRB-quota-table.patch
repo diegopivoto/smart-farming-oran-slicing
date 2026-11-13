@@ -1,0 +1,1066 @@
+From b2f064204fd1a5013afe6d3ec8f392455863f72e Mon Sep 17 00:00:00 2001
+From: Diego Pivoto <>
+Date: Mon, 2 Nov 2026 16:45:41 -0300
+Subject: [PATCH 1/6] feat(nr-mac): add atomic slice PRB quota table
+
+Per-S-NSSAI (optionally per-RNTI) downlink PRB quota restricted to
+{24,52,78,106}, with TTL expiry back to 106, idempotent action IDs,
+conflict detection for reused IDs and token-checked rollback. Writers
+serialize on a mutex and publish through a seqlock so the scheduler hot
+path only performs atomic loads.
+---
+ CMakeLists.txt                                |   1 +
+ openair2/LAYER2/CMakeLists.txt                |   1 +
+ openair2/LAYER2/NR_MAC_gNB/CMakeLists.txt     |   5 +
+ .../LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c   | 513 ++++++++++++++++++
+ .../LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h   | 181 ++++++
+ .../LAYER2/NR_MAC_gNB/tests/CMakeLists.txt    |   6 +
+ .../LAYER2/NR_MAC_gNB/tests/prb_quota_test.c  | 282 ++++++++++
+ 7 files changed, 989 insertions(+)
+ create mode 100644 openair2/LAYER2/NR_MAC_gNB/CMakeLists.txt
+ create mode 100644 openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c
+ create mode 100644 openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h
+ create mode 100644 openair2/LAYER2/NR_MAC_gNB/tests/CMakeLists.txt
+ create mode 100644 openair2/LAYER2/NR_MAC_gNB/tests/prb_quota_test.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5960709e92..59c71f13d0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1225,6 +1225,7 @@ set (MAC_NR_SRC
+   ${NR_GNB_MAC_DIR}/gNB_scheduler_bch.c
+   ${NR_GNB_MAC_DIR}/gNB_scheduler_dlsch.c
+   ${NR_GNB_MAC_DIR}/gNB_scheduler_dlsch_default_policies.c
++  ${NR_GNB_MAC_DIR}/smartfarm_prb_quota.c
+   ${NR_GNB_MAC_DIR}/gNB_scheduler_ulsch.c
+   ${NR_GNB_MAC_DIR}/gNB_scheduler_ulsch_default_policies.c
+   ${NR_GNB_MAC_DIR}/gNB_scheduler_primitives.c
+diff --git a/openair2/LAYER2/CMakeLists.txt b/openair2/LAYER2/CMakeLists.txt
+index c03055350d..c58a912865 100644
+--- a/openair2/LAYER2/CMakeLists.txt
++++ b/openair2/LAYER2/CMakeLists.txt
+@@ -4,3 +4,4 @@ add_subdirectory(nr_rlc)
+ add_subdirectory(nr_pdcp)
+ add_subdirectory(NR_MAC_COMMON)
+ add_subdirectory(NR_MAC_UE)
++add_subdirectory(NR_MAC_gNB)
+diff --git a/openair2/LAYER2/NR_MAC_gNB/CMakeLists.txt b/openair2/LAYER2/NR_MAC_gNB/CMakeLists.txt
+new file mode 100644
+index 0000000000..bb9a62909f
+--- /dev/null
++++ b/openair2/LAYER2/NR_MAC_gNB/CMakeLists.txt
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: LicenseRef-CSSL-1.0
++
++if(ENABLE_TESTS)
++  add_subdirectory(tests)
++endif()
+diff --git a/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c b/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c
+new file mode 100644
+index 0000000000..52c91fe21d
+--- /dev/null
++++ b/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c
+@@ -0,0 +1,513 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/*! \file smartfarm_prb_quota.c
++ * \brief Per-slice downlink PRB quota table (see smartfarm_prb_quota.h).
++ */
++
++#include "smartfarm_prb_quota.h"
++
++#include <string.h>
++#include <time.h>
++
++#define SF_SEQLOCK_READ_ATTEMPTS 4
++#define SF_MAX_CLOCK_SKEW_NS 1000000000ULL
++
++static const uint16_t valid_quotas[] = {24, 52, 78, 106};
++
++uint64_t sf_realtime_ns(void)
++{
++  struct timespec ts;
++  clock_gettime(CLOCK_REALTIME, &ts);
++  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
++
++bool sf_prb_quota_is_valid(uint16_t prb_quota)
++{
++  for (size_t i = 0; i < sizeof(valid_quotas) / sizeof(valid_quotas[0]); i++)
++    if (valid_quotas[i] == prb_quota)
++      return true;
++  return false;
++}
++
++const char *sf_quota_status_name(sf_quota_status_t status)
++{
++  static const char *names[SF_QUOTA_STATUS_END] = {
++      [SF_QUOTA_APPLIED] = "APPLIED",
++      [SF_QUOTA_ROLLED_BACK] = "ROLLED_BACK",
++      [SF_QUOTA_REJECTED_RANGE] = "REJECTED_RANGE",
++      [SF_QUOTA_REJECTED_TTL] = "REJECTED_TTL",
++      [SF_QUOTA_REJECTED_STALE] = "REJECTED_STALE",
++      [SF_QUOTA_REJECTED_TARGET] = "REJECTED_TARGET",
++      [SF_QUOTA_REJECTED_RUN] = "REJECTED_RUN",
++      [SF_QUOTA_CONFLICT] = "CONFLICT",
++      [SF_QUOTA_TABLE_FULL] = "TABLE_FULL",
++      [SF_QUOTA_ROLLBACK_UNKNOWN] = "ROLLBACK_UNKNOWN",
++      [SF_QUOTA_ROLLBACK_TOKEN] = "ROLLBACK_TOKEN",
++      [SF_QUOTA_ROLLBACK_SUPERSEDED] = "ROLLBACK_SUPERSEDED",
++  };
++  return status < SF_QUOTA_STATUS_END && names[status] != NULL ? names[status] : "UNKNOWN";
++}
++
++void sf_prb_quota_init(sf_prb_quota_table_t *table, uint64_t token_salt)
++{
++  memset(table, 0, sizeof(*table));
++  pthread_mutex_init(&table->lock, NULL);
++  table->token_salt = token_salt;
++}
++
++/* ── hashing helpers (writer side only) ─────────────────────────────────── */
++
++static uint64_t fnv1a(uint64_t hash, const void *data, size_t len)
++{
++  const uint8_t *bytes = data;
++  for (size_t i = 0; i < len; i++) {
++    hash ^= bytes[i];
++    hash *= 0x100000001b3ULL;
++  }
++  return hash;
++}
++
++static uint64_t splitmix64(uint64_t x)
++{
++  x += 0x9e3779b97f4a7c15ULL;
++  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
++  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
++  return x ^ (x >> 31);
++}
++
++static uint64_t fingerprint_action(const sf_prb_action_t *a)
++{
++  uint64_t h = 0xcbf29ce484222325ULL;
++  const uint8_t kind = 1;
++  h = fnv1a(h, &kind, sizeof(kind));
++  h = fnv1a(h, a->run_id, sizeof(a->run_id));
++  h = fnv1a(h, &a->target.sst, sizeof(a->target.sst));
++  h = fnv1a(h, &a->target.sd, sizeof(a->target.sd));
++  h = fnv1a(h, &a->target.rnti, sizeof(a->target.rnti));
++  h = fnv1a(h, &a->prb_quota, sizeof(a->prb_quota));
++  h = fnv1a(h, &a->ttl_ms, sizeof(a->ttl_ms));
++  h = fnv1a(h, &a->issued_at_ns, sizeof(a->issued_at_ns));
++  return h;
++}
++
++static uint64_t fingerprint_rollback(const sf_rollback_t *r)
++{
++  uint64_t h = 0xcbf29ce484222325ULL;
++  const uint8_t kind = 2;
++  h = fnv1a(h, &kind, sizeof(kind));
++  h = fnv1a(h, r->run_id, sizeof(r->run_id));
++  h = fnv1a(h, &r->target_action_id, sizeof(r->target_action_id));
++  h = fnv1a(h, &r->rollback_token, sizeof(r->rollback_token));
++  h = fnv1a(h, &r->ttl_ms, sizeof(r->ttl_ms));
++  h = fnv1a(h, &r->issued_at_ns, sizeof(r->issued_at_ns));
++  return h;
++}
++
++static bool run_id_present(const uint8_t run_id[SF_PRB_QUOTA_RUN_ID_LEN])
++{
++  for (int i = 0; i < SF_PRB_QUOTA_RUN_ID_LEN; i++)
++    if (run_id[i] != 0)
++      return true;
++  return false;
++}
++
++static sf_quota_status_t check_freshness(uint32_t ttl_ms, uint64_t issued_at_ns, uint64_t now_ns)
++{
++  if (ttl_ms == 0 || ttl_ms > SF_PRB_QUOTA_MAX_TTL_MS)
++    return SF_QUOTA_REJECTED_TTL;
++  if (issued_at_ns > now_ns + SF_MAX_CLOCK_SKEW_NS)
++    return SF_QUOTA_REJECTED_STALE;
++  if (now_ns > issued_at_ns && now_ns - issued_at_ns >= (uint64_t)ttl_ms * 1000000ULL)
++    return SF_QUOTA_REJECTED_STALE;
++  return SF_QUOTA_APPLIED;
++}
++
++/* ── history (writer side only, under lock) ─────────────────────────────── */
++
++static sf_quota_history_t *history_find(sf_prb_quota_table_t *t, uint64_t action_id)
++{
++  for (uint32_t i = 0; i < t->history_len; i++) {
++    sf_quota_history_t *h = &t->history[i];
++    if (h->action_id == action_id)
++      return h;
++  }
++  return NULL;
++}
++
++static sf_quota_history_t *history_push(sf_prb_quota_table_t *t)
++{
++  sf_quota_history_t *h = &t->history[t->history_next];
++  memset(h, 0, sizeof(*h));
++  t->history_next = (t->history_next + 1) % SF_PRB_QUOTA_HISTORY;
++  if (t->history_len < SF_PRB_QUOTA_HISTORY)
++    t->history_len++;
++  return h;
++}
++
++/* ── seqlock ────────────────────────────────────────────────────────────── */
++
++static void write_begin(sf_prb_quota_table_t *t)
++{
++  uint32_t s = atomic_load_explicit(&t->seq, memory_order_relaxed);
++  atomic_store_explicit(&t->seq, s + 1, memory_order_relaxed);
++  atomic_thread_fence(memory_order_release);
++}
++
++static void write_end(sf_prb_quota_table_t *t)
++{
++  uint32_t s = atomic_load_explicit(&t->seq, memory_order_relaxed);
++  atomic_store_explicit(&t->seq, s + 1, memory_order_release);
++  atomic_fetch_add_explicit(&t->version, 1, memory_order_relaxed);
++}
++
++static void rule_store(sf_prb_rule_t *r, sf_prb_target_t target, uint16_t quota, uint64_t expires, uint64_t action_id)
++{
++  atomic_store_explicit(&r->sst, target.sst, memory_order_relaxed);
++  atomic_store_explicit(&r->sd, target.sd, memory_order_relaxed);
++  atomic_store_explicit(&r->rnti, target.rnti, memory_order_relaxed);
++  atomic_store_explicit(&r->prb_quota, quota, memory_order_relaxed);
++  atomic_store_explicit(&r->expires_at_ns, expires, memory_order_relaxed);
++  atomic_store_explicit(&r->action_id, action_id, memory_order_relaxed);
++  atomic_store_explicit(&r->in_use, true, memory_order_relaxed);
++}
++
++typedef struct {
++  bool in_use;
++  sf_prb_target_t target;
++  uint16_t quota;
++  uint64_t expires_at_ns;
++  uint64_t action_id;
++} rule_view_t;
++
++static rule_view_t rule_load(sf_prb_rule_t *r)
++{
++  return (rule_view_t){
++      .in_use = atomic_load_explicit(&r->in_use, memory_order_relaxed),
++      .target = {.sst = atomic_load_explicit(&r->sst, memory_order_relaxed),
++                 .sd = atomic_load_explicit(&r->sd, memory_order_relaxed),
++                 .rnti = atomic_load_explicit(&r->rnti, memory_order_relaxed)},
++      .quota = atomic_load_explicit(&r->prb_quota, memory_order_relaxed),
++      .expires_at_ns = atomic_load_explicit(&r->expires_at_ns, memory_order_relaxed),
++      .action_id = atomic_load_explicit(&r->action_id, memory_order_relaxed),
++  };
++}
++
++static bool same_key(sf_prb_target_t a, sf_prb_target_t b)
++{
++  return a.sst == b.sst && a.sd == b.sd && a.rnti == b.rnti;
++}
++
++/* Index of the live rule installed for exactly this key, or -1. Writer side. */
++static int find_exact(sf_prb_quota_table_t *t, sf_prb_target_t key, uint64_t now_ns)
++{
++  for (int i = 0; i < SF_PRB_QUOTA_MAX_RULES; i++) {
++    rule_view_t v = rule_load(&t->rules[i]);
++    if (v.in_use && v.expires_at_ns > now_ns && same_key(v.target, key))
++      return i;
++  }
++  return -1;
++}
++
++static int find_free(sf_prb_quota_table_t *t, uint64_t now_ns)
++{
++  for (int i = 0; i < SF_PRB_QUOTA_MAX_RULES; i++) {
++    rule_view_t v = rule_load(&t->rules[i]);
++    if (!v.in_use || v.expires_at_ns <= now_ns)
++      return i;
++  }
++  return -1;
++}
++
++/* ── reader (scheduler hot path) ────────────────────────────────────────── */
++
++static uint16_t resolve(const rule_view_t views[SF_PRB_QUOTA_MAX_RULES],
++                        sf_prb_target_t target,
++                        uint64_t now_ns,
++                        sf_quota_meta_t *meta)
++{
++  const rule_view_t *slice_rule = NULL;
++  const rule_view_t *ue_rule = NULL;
++  for (int i = 0; i < SF_PRB_QUOTA_MAX_RULES; i++) {
++    const rule_view_t *v = &views[i];
++    if (!v->in_use || v->target.sst != target.sst || v->target.sd != target.sd)
++      continue;
++    if (v->target.rnti != 0 && v->target.rnti != target.rnti)
++      continue;
++    if (v->expires_at_ns <= now_ns) {
++      meta->expired = true;
++      continue;
++    }
++    if (v->target.rnti == 0)
++      slice_rule = v;
++    else
++      ue_rule = v;
++  }
++  const rule_view_t *chosen = ue_rule != NULL ? ue_rule : slice_rule;
++  if (chosen == NULL)
++    return SF_PRB_QUOTA_DEFAULT;
++  meta->matched = true;
++  meta->expired = false;
++  meta->action_id = chosen->action_id;
++  return chosen->quota;
++}
++
++uint16_t sf_prb_quota_lookup(sf_prb_quota_table_t *table, sf_prb_target_t target, uint64_t now_ns, sf_quota_meta_t *meta)
++{
++  sf_quota_meta_t local = {0};
++  sf_quota_meta_t *m = meta != NULL ? meta : &local;
++  memset(m, 0, sizeof(*m));
++  atomic_fetch_add_explicit(&table->counters.lookups, 1, memory_order_relaxed);
++
++  if (target.sst == 0 && target.sd == SF_PRB_QUOTA_NO_SD) {
++    atomic_fetch_add_explicit(&table->counters.unmapped, 1, memory_order_relaxed);
++    return SF_PRB_QUOTA_DEFAULT;
++  }
++
++  rule_view_t views[SF_PRB_QUOTA_MAX_RULES];
++  for (int attempt = 0; attempt < SF_SEQLOCK_READ_ATTEMPTS; attempt++) {
++    uint32_t s1 = atomic_load_explicit(&table->seq, memory_order_acquire);
++    if (s1 & 1U)
++      continue;
++    for (int i = 0; i < SF_PRB_QUOTA_MAX_RULES; i++)
++      views[i] = rule_load(&table->rules[i]);
++    uint32_t version = atomic_load_explicit(&table->version, memory_order_relaxed);
++    atomic_thread_fence(memory_order_acquire);
++    uint32_t s2 = atomic_load_explicit(&table->seq, memory_order_relaxed);
++    if (s1 != s2)
++      continue;
++    uint16_t quota = resolve(views, target, now_ns, m);
++    m->table_version = version;
++    if (m->expired)
++      atomic_fetch_add_explicit(&table->counters.expired, 1, memory_order_relaxed);
++    /* defensive: a torn view can never yield an out-of-range quota */
++    return sf_prb_quota_is_valid(quota) ? quota : SF_PRB_QUOTA_DEFAULT;
++  }
++  m->fallback = true;
++  atomic_fetch_add_explicit(&table->counters.fallback, 1, memory_order_relaxed);
++  return SF_PRB_QUOTA_DEFAULT;
++}
++
++/* Effective quota for a target, read by the (single) writer under lock. */
++static uint16_t effective_locked(sf_prb_quota_table_t *t, sf_prb_target_t target, uint64_t now_ns, uint64_t *expires)
++{
++  rule_view_t views[SF_PRB_QUOTA_MAX_RULES];
++  for (int i = 0; i < SF_PRB_QUOTA_MAX_RULES; i++)
++    views[i] = rule_load(&t->rules[i]);
++  sf_quota_meta_t meta = {0};
++  uint16_t q = resolve(views, target, now_ns, &meta);
++  if (expires != NULL) {
++    *expires = 0;
++    for (int i = 0; meta.matched && i < SF_PRB_QUOTA_MAX_RULES; i++)
++      if (views[i].in_use && views[i].action_id == meta.action_id)
++        *expires = views[i].expires_at_ns;
++  }
++  return q;
++}
++
++/* ── writers ────────────────────────────────────────────────────────────── */
++
++static sf_quota_outcome_t record(sf_prb_quota_table_t *t,
++                                 uint64_t action_id,
++                                 uint64_t fingerprint,
++                                 sf_quota_outcome_t outcome,
++                                 const sf_quota_history_t *undo)
++{
++  outcome.table_version = atomic_load_explicit(&t->version, memory_order_relaxed);
++  sf_quota_history_t *h = history_push(t);
++  if (undo != NULL)
++    *h = *undo;
++  h->action_id = action_id;
++  h->fingerprint = fingerprint;
++  h->outcome = outcome;
++  return outcome;
++}
++
++sf_quota_outcome_t sf_prb_quota_apply(sf_prb_quota_table_t *table, const sf_prb_action_t *action, uint64_t now_ns)
++{
++  sf_quota_outcome_t out = {
++      .action_id = action->action_id,
++      .target = action->target,
++      .requested_prb = action->prb_quota,
++  };
++  const uint64_t fp = fingerprint_action(action);
++
++  pthread_mutex_lock(&table->lock);
++  sf_quota_history_t *seen = history_find(table, action->action_id);
++  if (seen != NULL) {
++    if (seen->fingerprint == fp) {
++      out = seen->outcome;
++      out.duplicate = true;
++    } else {
++      out.status = SF_QUOTA_CONFLICT;
++      out.applied_prb = out.previous_prb = effective_locked(table, action->target, now_ns, &out.expires_at_ns);
++    }
++    pthread_mutex_unlock(&table->lock);
++    return out;
++  }
++
++  out.previous_prb = effective_locked(table, action->target, now_ns, NULL);
++  out.applied_prb = out.previous_prb;
++
++  sf_quota_status_t status = SF_QUOTA_APPLIED;
++  if (!run_id_present(action->run_id))
++    status = SF_QUOTA_REJECTED_RUN;
++  else if (action->target.sd > SF_PRB_QUOTA_NO_SD || (action->target.sst == 0 && action->target.sd == SF_PRB_QUOTA_NO_SD))
++    status = SF_QUOTA_REJECTED_TARGET;
++  else if (!sf_prb_quota_is_valid(action->prb_quota))
++    status = SF_QUOTA_REJECTED_RANGE;
++  else
++    status = check_freshness(action->ttl_ms, action->issued_at_ns, now_ns);
++
++  int slot = -1;
++  if (status == SF_QUOTA_APPLIED) {
++    slot = find_exact(table, action->target, now_ns);
++    if (slot < 0)
++      slot = find_free(table, now_ns);
++    if (slot < 0)
++      status = SF_QUOTA_TABLE_FULL;
++  }
++  out.status = status;
++  if (status != SF_QUOTA_APPLIED) {
++    out = record(table, action->action_id, fp, out, NULL);
++    pthread_mutex_unlock(&table->lock);
++    return out;
++  }
++
++  sf_quota_history_t undo = {.is_quota_action = true, .target = action->target};
++  rule_view_t prev = rule_load(&table->rules[slot]);
++  if (prev.in_use && prev.expires_at_ns > now_ns && same_key(prev.target, action->target)) {
++    undo.had_previous = true;
++    undo.previous_quota = prev.quota;
++    undo.previous_expires_at_ns = prev.expires_at_ns;
++    undo.previous_action_id = prev.action_id;
++  }
++
++  const uint64_t expires = now_ns + (uint64_t)action->ttl_ms * 1000000ULL;
++  write_begin(table);
++  rule_store(&table->rules[slot], action->target, action->prb_quota, expires, action->action_id);
++  write_end(table);
++
++  out.applied_prb = effective_locked(table, action->target, now_ns, NULL);
++  out.expires_at_ns = expires;
++  out.rollback_token = splitmix64(action->action_id ^ table->token_salt ^ fp);
++  out = record(table, action->action_id, fp, out, &undo);
++  pthread_mutex_unlock(&table->lock);
++  return out;
++}
++
++sf_quota_outcome_t sf_prb_quota_rollback(sf_prb_quota_table_t *table, const sf_rollback_t *rollback, uint64_t now_ns)
++{
++  sf_quota_outcome_t out = {.action_id = rollback->action_id};
++  const uint64_t fp = fingerprint_rollback(rollback);
++
++  pthread_mutex_lock(&table->lock);
++  sf_quota_history_t *seen = history_find(table, rollback->action_id);
++  if (seen != NULL) {
++    if (seen->fingerprint == fp) {
++      out = seen->outcome;
++      out.duplicate = true;
++    } else {
++      out.status = SF_QUOTA_CONFLICT;
++    }
++    pthread_mutex_unlock(&table->lock);
++    return out;
++  }
++
++  sf_quota_status_t status = SF_QUOTA_ROLLED_BACK;
++  if (!run_id_present(rollback->run_id))
++    status = SF_QUOTA_REJECTED_RUN;
++  else if (check_freshness(rollback->ttl_ms, rollback->issued_at_ns, now_ns) != SF_QUOTA_APPLIED)
++    status = check_freshness(rollback->ttl_ms, rollback->issued_at_ns, now_ns);
++
++  sf_quota_history_t *target = NULL;
++  if (status == SF_QUOTA_ROLLED_BACK) {
++    target = history_find(table, rollback->target_action_id);
++    if (target == NULL || !target->is_quota_action || target->outcome.status != SF_QUOTA_APPLIED)
++      status = SF_QUOTA_ROLLBACK_UNKNOWN;
++    else if (target->outcome.rollback_token != rollback->rollback_token)
++      status = SF_QUOTA_ROLLBACK_TOKEN;
++  }
++
++  int slot = -1;
++  if (status == SF_QUOTA_ROLLED_BACK) {
++    out.target = target->target;
++    slot = find_exact(table, target->target, now_ns);
++    rule_view_t current = slot >= 0 ? rule_load(&table->rules[slot]) : (rule_view_t){0};
++    if (slot < 0 || current.action_id != rollback->target_action_id)
++      status = SF_QUOTA_ROLLBACK_SUPERSEDED;
++  }
++
++  if (target != NULL)
++    out.target = target->target;
++  out.previous_prb = effective_locked(table, out.target, now_ns, NULL);
++  out.applied_prb = out.previous_prb;
++  out.status = status;
++  if (status != SF_QUOTA_ROLLED_BACK) {
++    out = record(table, rollback->action_id, fp, out, NULL);
++    pthread_mutex_unlock(&table->lock);
++    return out;
++  }
++
++  write_begin(table);
++  if (target->had_previous && target->previous_expires_at_ns > now_ns) {
++    rule_store(&table->rules[slot], target->target, target->previous_quota, target->previous_expires_at_ns,
++               target->previous_action_id);
++  } else {
++    atomic_store_explicit(&table->rules[slot].in_use, false, memory_order_relaxed);
++  }
++  write_end(table);
++
++  out.applied_prb = effective_locked(table, out.target, now_ns, &out.expires_at_ns);
++  out = record(table, rollback->action_id, fp, out, NULL);
++  pthread_mutex_unlock(&table->lock);
++  return out;
++}
++
++int sf_prb_quota_snapshot(sf_prb_quota_table_t *table,
++                          uint64_t now_ns,
++                          sf_prb_rule_snapshot_t rules[SF_PRB_QUOTA_MAX_RULES],
++                          uint32_t *version)
++{
++  pthread_mutex_lock(&table->lock);
++  int n = 0;
++  for (int i = 0; i < SF_PRB_QUOTA_MAX_RULES; i++) {
++    rule_view_t v = rule_load(&table->rules[i]);
++    if (!v.in_use || v.expires_at_ns <= now_ns)
++      continue;
++    rules[n++] = (sf_prb_rule_snapshot_t){
++        .target = v.target,
++        .prb_quota = v.quota,
++        .expires_at_ns = v.expires_at_ns,
++        .action_id = v.action_id,
++    };
++  }
++  if (version != NULL)
++    *version = atomic_load_explicit(&table->version, memory_order_relaxed);
++  pthread_mutex_unlock(&table->lock);
++  return n;
++}
++
++sf_quota_counters_snapshot_t sf_prb_quota_counters(sf_prb_quota_table_t *table)
++{
++  sf_quota_counters_t *c = &table->counters;
++  return (sf_quota_counters_snapshot_t){
++      .lookups = atomic_load_explicit(&c->lookups, memory_order_relaxed),
++      .unmapped = atomic_load_explicit(&c->unmapped, memory_order_relaxed),
++      .expired = atomic_load_explicit(&c->expired, memory_order_relaxed),
++      .fallback = atomic_load_explicit(&c->fallback, memory_order_relaxed),
++      .capped_newtx = atomic_load_explicit(&c->capped_newtx, memory_order_relaxed),
++      .bypass_retx = atomic_load_explicit(&c->bypass_retx, memory_order_relaxed),
++  };
++}
++
++void sf_prb_quota_count_capped(sf_prb_quota_table_t *table)
++{
++  atomic_fetch_add_explicit(&table->counters.capped_newtx, 1, memory_order_relaxed);
++}
++
++void sf_prb_quota_count_bypass_retx(sf_prb_quota_table_t *table)
++{
++  atomic_fetch_add_explicit(&table->counters.bypass_retx, 1, memory_order_relaxed);
++}
+diff --git a/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h b/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h
+new file mode 100644
+index 0000000000..dbc96eb326
+--- /dev/null
++++ b/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h
+@@ -0,0 +1,181 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/*! \file smartfarm_prb_quota.h
++ * \brief Per-slice downlink PRB quota table for the Smart Farming testbed.
++ *
++ * The table caps the number of PRBs the DL scheduler may give to *new*
++ * transmissions of UEs whose first DRB belongs to a given S-NSSAI. HARQ
++ * retransmissions are never truncated. Writers (E2 agent) serialize on a mutex
++ * and publish through a sequence lock; the scheduler hot path only performs
++ * atomic loads and never blocks, allocates or logs.
++ *
++ * All timestamps are CLOCK_REALTIME nanoseconds: the issuer (near-RT RIC xApp)
++ * runs on the same host, so one clock serves staleness and expiry checks.
++ */
++
++#ifndef SMARTFARM_PRB_QUOTA_H
++#define SMARTFARM_PRB_QUOTA_H
++
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++#define SF_PRB_QUOTA_DEFAULT 106
++#define SF_PRB_QUOTA_MAX_RULES 4
++#define SF_PRB_QUOTA_HISTORY 64
++#define SF_PRB_QUOTA_MAX_TTL_MS 30000U
++#define SF_PRB_QUOTA_RUN_ID_LEN 16
++#define SF_PRB_QUOTA_NO_SD 0xFFFFFFU
++
++typedef enum {
++  SF_QUOTA_APPLIED = 0,
++  SF_QUOTA_ROLLED_BACK,
++  SF_QUOTA_REJECTED_RANGE,
++  SF_QUOTA_REJECTED_TTL,
++  SF_QUOTA_REJECTED_STALE,
++  SF_QUOTA_REJECTED_TARGET,
++  SF_QUOTA_REJECTED_RUN,
++  SF_QUOTA_CONFLICT,
++  SF_QUOTA_TABLE_FULL,
++  SF_QUOTA_ROLLBACK_UNKNOWN,
++  SF_QUOTA_ROLLBACK_TOKEN,
++  SF_QUOTA_ROLLBACK_SUPERSEDED,
++  SF_QUOTA_STATUS_END
++} sf_quota_status_t;
++
++typedef struct {
++  uint8_t sst;
++  uint32_t sd; /* 24-bit SD; SF_PRB_QUOTA_NO_SD when the slice has none */
++  uint16_t rnti; /* 0 = every UE of the slice */
++} sf_prb_target_t;
++
++typedef struct {
++  uint64_t action_id;
++  uint8_t run_id[SF_PRB_QUOTA_RUN_ID_LEN];
++  sf_prb_target_t target;
++  uint16_t prb_quota;
++  uint32_t ttl_ms;
++  uint64_t issued_at_ns;
++} sf_prb_action_t;
++
++typedef struct {
++  uint64_t action_id; /* id of this rollback request (idempotency key) */
++  uint8_t run_id[SF_PRB_QUOTA_RUN_ID_LEN];
++  uint64_t target_action_id; /* action being undone */
++  uint64_t rollback_token; /* token returned when target_action_id was applied */
++  uint32_t ttl_ms;
++  uint64_t issued_at_ns;
++} sf_rollback_t;
++
++typedef struct {
++  sf_quota_status_t status;
++  bool duplicate; /* true when the stored outcome of a repeated request is returned */
++  uint64_t action_id;
++  sf_prb_target_t target;
++  uint16_t requested_prb;
++  uint16_t applied_prb; /* quota effective for the target after the request */
++  uint16_t previous_prb; /* quota effective for the target before the request */
++  uint64_t rollback_token;
++  uint64_t expires_at_ns; /* 0 when no rule is installed */
++  uint32_t table_version;
++} sf_quota_outcome_t;
++
++typedef struct {
++  bool matched; /* a live rule matched the target */
++  bool expired; /* a matching rule existed but its TTL elapsed */
++  bool fallback; /* reader gave up on a concurrent update and used the default */
++  uint64_t action_id;
++  uint32_t table_version;
++} sf_quota_meta_t;
++
++/* A published rule. Every field is atomic so readers never race with writers. */
++typedef struct {
++  atomic_bool in_use;
++  atomic_uint_least8_t sst;
++  atomic_uint_least32_t sd;
++  atomic_uint_least16_t rnti;
++  atomic_uint_least16_t prb_quota;
++  atomic_uint_least64_t expires_at_ns;
++  atomic_uint_least64_t action_id;
++} sf_prb_rule_t;
++
++typedef struct {
++  uint64_t action_id;
++  uint64_t fingerprint;
++  sf_quota_outcome_t outcome;
++  /* state replaced by this action, restored by a rollback */
++  bool had_previous;
++  sf_prb_target_t target;
++  uint16_t previous_quota;
++  uint64_t previous_expires_at_ns;
++  uint64_t previous_action_id;
++  bool is_quota_action;
++} sf_quota_history_t;
++
++typedef struct {
++  atomic_uint_least64_t lookups;
++  atomic_uint_least64_t unmapped;
++  atomic_uint_least64_t expired;
++  atomic_uint_least64_t fallback;
++  atomic_uint_least64_t capped_newtx;
++  atomic_uint_least64_t bypass_retx;
++} sf_quota_counters_t;
++
++typedef struct {
++  atomic_uint_least32_t seq;
++  atomic_uint_least32_t version;
++  sf_prb_rule_t rules[SF_PRB_QUOTA_MAX_RULES];
++  sf_quota_counters_t counters;
++  /* writer-only state, guarded by lock */
++  pthread_mutex_t lock;
++  sf_quota_history_t history[SF_PRB_QUOTA_HISTORY];
++  uint32_t history_next;
++  uint32_t history_len;
++  uint64_t token_salt;
++} sf_prb_quota_table_t;
++
++typedef struct {
++  sf_prb_target_t target;
++  uint16_t prb_quota;
++  uint64_t expires_at_ns;
++  uint64_t action_id;
++} sf_prb_rule_snapshot_t;
++
++typedef struct {
++  uint64_t lookups;
++  uint64_t unmapped;
++  uint64_t expired;
++  uint64_t fallback;
++  uint64_t capped_newtx;
++  uint64_t bypass_retx;
++} sf_quota_counters_snapshot_t;
++
++void sf_prb_quota_init(sf_prb_quota_table_t *table, uint64_t token_salt);
++
++bool sf_prb_quota_is_valid(uint16_t prb_quota);
++
++sf_quota_outcome_t sf_prb_quota_apply(sf_prb_quota_table_t *table, const sf_prb_action_t *action, uint64_t now_ns);
++
++uint16_t sf_prb_quota_lookup(sf_prb_quota_table_t *table, sf_prb_target_t target, uint64_t now_ns, sf_quota_meta_t *meta);
++
++sf_quota_outcome_t sf_prb_quota_rollback(sf_prb_quota_table_t *table, const sf_rollback_t *rollback, uint64_t now_ns);
++
++/* Copies live (non-expired) rules; returns how many were written. */
++int sf_prb_quota_snapshot(sf_prb_quota_table_t *table,
++                          uint64_t now_ns,
++                          sf_prb_rule_snapshot_t rules[SF_PRB_QUOTA_MAX_RULES],
++                          uint32_t *version);
++
++sf_quota_counters_snapshot_t sf_prb_quota_counters(sf_prb_quota_table_t *table);
++
++void sf_prb_quota_count_capped(sf_prb_quota_table_t *table);
++void sf_prb_quota_count_bypass_retx(sf_prb_quota_table_t *table);
++
++const char *sf_quota_status_name(sf_quota_status_t status);
++
++uint64_t sf_realtime_ns(void);
++
++#endif
+diff --git a/openair2/LAYER2/NR_MAC_gNB/tests/CMakeLists.txt b/openair2/LAYER2/NR_MAC_gNB/tests/CMakeLists.txt
+new file mode 100644
+index 0000000000..e602bfa0df
+--- /dev/null
++++ b/openair2/LAYER2/NR_MAC_gNB/tests/CMakeLists.txt
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: LicenseRef-CSSL-1.0
++
++add_executable(prb_quota_test prb_quota_test.c ../smartfarm_prb_quota.c)
++target_link_libraries(prb_quota_test PRIVATE pthread)
++add_dependencies(tests prb_quota_test)
++add_test(NAME prb_quota_test COMMAND prb_quota_test)
+diff --git a/openair2/LAYER2/NR_MAC_gNB/tests/prb_quota_test.c b/openair2/LAYER2/NR_MAC_gNB/tests/prb_quota_test.c
+new file mode 100644
+index 0000000000..dc3eaddb35
+--- /dev/null
++++ b/openair2/LAYER2/NR_MAC_gNB/tests/prb_quota_test.c
+@@ -0,0 +1,282 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++#include "../smartfarm_prb_quota.h"
++
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(cond)                                                    \
++  do {                                                                 \
++    if (!(cond)) {                                                     \
++      fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
++      exit(1);                                                         \
++    }                                                                  \
++  } while (0)
++
++static const uint64_t SEC = 1000000000ULL;
++static const uint64_t T0 = 1793646912ULL * 1000000000ULL;
++
++static sf_prb_action_t action(uint64_t id, uint32_t sd, uint16_t rnti, uint16_t prb)
++{
++  sf_prb_action_t a = {
++      .action_id = id,
++      .target = {.sst = 1, .sd = sd, .rnti = rnti},
++      .prb_quota = prb,
++      .ttl_ms = 30000,
++      .issued_at_ns = T0,
++  };
++  memset(a.run_id, 0xab, sizeof(a.run_id));
++  return a;
++}
++
++static sf_prb_target_t ue(uint32_t sd, uint16_t rnti)
++{
++  return (sf_prb_target_t){.sst = 1, .sd = sd, .rnti = rnti};
++}
++
++static void test_default_and_valid_range(void)
++{
++  sf_prb_quota_table_t t;
++  sf_prb_quota_init(&t, 7);
++  sf_quota_meta_t meta;
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 0x4601), T0, &meta) == 106);
++  CHECK(!meta.matched);
++
++  const uint16_t valid[] = {24, 52, 78, 106};
++  for (size_t i = 0; i < 4; i++) {
++    sf_prb_action_t a = action(10 + i, 1, 0, valid[i]);
++    sf_quota_outcome_t o = sf_prb_quota_apply(&t, &a, T0);
++    CHECK(o.status == SF_QUOTA_APPLIED);
++    CHECK(!o.duplicate);
++    CHECK(o.requested_prb == valid[i] && o.applied_prb == valid[i]);
++    CHECK(sf_prb_quota_lookup(&t, ue(1, 0x4601), T0 + SEC, &meta) == valid[i]);
++    CHECK(meta.matched && meta.action_id == 10 + i);
++  }
++
++  const uint16_t invalid[] = {0, 23, 25, 107, 275};
++  for (size_t i = 0; i < 5; i++) {
++    sf_prb_action_t a = action(100 + i, 2, 0, invalid[i]);
++    sf_quota_outcome_t o = sf_prb_quota_apply(&t, &a, T0);
++    CHECK(o.status == SF_QUOTA_REJECTED_RANGE);
++    CHECK(sf_prb_quota_lookup(&t, ue(2, 0x4601), T0, NULL) == 106);
++  }
++}
++
++static void test_slices_and_rnti_do_not_leak(void)
++{
++  sf_prb_quota_table_t t;
++  sf_prb_quota_init(&t, 7);
++  sf_prb_action_t a1 = action(1, 1, 0, 24);
++  sf_prb_action_t a2 = action(2, 2, 0, 78);
++  sf_prb_action_t a3 = action(3, 1, 0x4602, 52);
++  CHECK(sf_prb_quota_apply(&t, &a1, T0).status == SF_QUOTA_APPLIED);
++  CHECK(sf_prb_quota_apply(&t, &a2, T0).status == SF_QUOTA_APPLIED);
++  CHECK(sf_prb_quota_apply(&t, &a3, T0).status == SF_QUOTA_APPLIED);
++
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 0x4601), T0, NULL) == 24);
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 0x4602), T0, NULL) == 52); /* RNTI rule wins */
++  CHECK(sf_prb_quota_lookup(&t, ue(2, 0x4601), T0, NULL) == 78);
++  CHECK(sf_prb_quota_lookup(&t, ue(3, 0x4601), T0, NULL) == 106);
++  sf_prb_target_t other_sst = {.sst = 2, .sd = 1, .rnti = 0x4601};
++  CHECK(sf_prb_quota_lookup(&t, other_sst, T0, NULL) == 106);
++}
++
++static void test_unmapped_ue_counts(void)
++{
++  sf_prb_quota_table_t t;
++  sf_prb_quota_init(&t, 7);
++  sf_prb_action_t a = action(1, 1, 0, 24);
++  sf_prb_quota_apply(&t, &a, T0);
++  sf_prb_target_t no_drb = {.sst = 0, .sd = SF_PRB_QUOTA_NO_SD, .rnti = 0x4601};
++  CHECK(sf_prb_quota_lookup(&t, no_drb, T0, NULL) == 106);
++  CHECK(sf_prb_quota_counters(&t).unmapped == 1);
++}
++
++static void test_expiry_returns_default(void)
++{
++  sf_prb_quota_table_t t;
++  sf_prb_quota_init(&t, 7);
++  sf_prb_action_t a = action(1, 1, 0, 24);
++  a.ttl_ms = 2000;
++  sf_quota_outcome_t o = sf_prb_quota_apply(&t, &a, T0);
++  CHECK(o.status == SF_QUOTA_APPLIED);
++  CHECK(o.expires_at_ns == T0 + 2 * SEC);
++  sf_quota_meta_t meta;
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 1), T0 + SEC, &meta) == 24);
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 1), T0 + 2 * SEC, &meta) == 106);
++  CHECK(meta.expired && !meta.matched);
++  CHECK(sf_prb_quota_counters(&t).expired == 1);
++
++  sf_prb_rule_snapshot_t rules[SF_PRB_QUOTA_MAX_RULES];
++  uint32_t version = 0;
++  CHECK(sf_prb_quota_snapshot(&t, T0 + 3 * SEC, rules, &version) == 0);
++}
++
++static void test_ttl_and_staleness(void)
++{
++  sf_prb_quota_table_t t;
++  sf_prb_quota_init(&t, 7);
++  sf_prb_action_t a = action(1, 1, 0, 24);
++  a.ttl_ms = 0;
++  CHECK(sf_prb_quota_apply(&t, &a, T0).status == SF_QUOTA_REJECTED_TTL);
++  a.action_id = 11;
++  a.ttl_ms = SF_PRB_QUOTA_MAX_TTL_MS + 1;
++  CHECK(sf_prb_quota_apply(&t, &a, T0).status == SF_QUOTA_REJECTED_TTL);
++
++  sf_prb_action_t stale = action(2, 1, 0, 24);
++  stale.ttl_ms = 1000;
++  CHECK(sf_prb_quota_apply(&t, &stale, T0 + 2 * SEC).status == SF_QUOTA_REJECTED_STALE);
++
++  sf_prb_action_t future = action(3, 1, 0, 24);
++  future.issued_at_ns = T0 + 10 * SEC;
++  CHECK(sf_prb_quota_apply(&t, &future, T0).status == SF_QUOTA_REJECTED_STALE);
++
++  sf_prb_action_t no_run = action(4, 1, 0, 24);
++  memset(no_run.run_id, 0, sizeof(no_run.run_id));
++  CHECK(sf_prb_quota_apply(&t, &no_run, T0).status == SF_QUOTA_REJECTED_RUN);
++
++  sf_prb_action_t bad_sd = action(5, 0x1000000, 0, 24);
++  CHECK(sf_prb_quota_apply(&t, &bad_sd, T0).status == SF_QUOTA_REJECTED_TARGET);
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 1), T0, NULL) == 106);
++}
++
++static void test_duplicate_and_conflict(void)
++{
++  sf_prb_quota_table_t t;
++  sf_prb_quota_init(&t, 7);
++  sf_prb_action_t a = action(42, 1, 0, 52);
++  sf_quota_outcome_t first = sf_prb_quota_apply(&t, &a, T0);
++  CHECK(first.status == SF_QUOTA_APPLIED);
++
++  /* a newer action changes the slice; replaying 42 must not reapply 52 */
++  sf_prb_action_t b = action(43, 1, 0, 24);
++  CHECK(sf_prb_quota_apply(&t, &b, T0).status == SF_QUOTA_APPLIED);
++  sf_quota_outcome_t again = sf_prb_quota_apply(&t, &a, T0 + SEC);
++  CHECK(again.duplicate);
++  CHECK(again.status == first.status && again.applied_prb == 52);
++  CHECK(again.rollback_token == first.rollback_token);
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 1), T0 + SEC, NULL) == 24);
++
++  sf_prb_action_t different = action(42, 1, 0, 78);
++  sf_quota_outcome_t conflict = sf_prb_quota_apply(&t, &different, T0);
++  CHECK(conflict.status == SF_QUOTA_CONFLICT);
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 1), T0, NULL) == 24);
++}
++
++static void test_rollback(void)
++{
++  sf_prb_quota_table_t t;
++  sf_prb_quota_init(&t, 7);
++  sf_prb_action_t a = action(1, 1, 0, 52);
++  sf_quota_outcome_t applied_a = sf_prb_quota_apply(&t, &a, T0);
++  sf_prb_action_t b = action(2, 1, 0, 24);
++  sf_quota_outcome_t applied_b = sf_prb_quota_apply(&t, &b, T0);
++  CHECK(applied_b.previous_prb == 52);
++
++  sf_rollback_t wrong = {.action_id = 90, .target_action_id = 2, .rollback_token = applied_b.rollback_token ^ 1,
++                         .ttl_ms = 30000, .issued_at_ns = T0};
++  memset(wrong.run_id, 0xab, sizeof(wrong.run_id));
++  CHECK(sf_prb_quota_rollback(&t, &wrong, T0).status == SF_QUOTA_ROLLBACK_TOKEN);
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 1), T0, NULL) == 24);
++
++  sf_rollback_t unknown = wrong;
++  unknown.action_id = 91;
++  unknown.target_action_id = 999;
++  CHECK(sf_prb_quota_rollback(&t, &unknown, T0).status == SF_QUOTA_ROLLBACK_UNKNOWN);
++
++  /* undoing a superseded action is refused: it would clobber the newer rule */
++  sf_rollback_t old = wrong;
++  old.action_id = 92;
++  old.target_action_id = 1;
++  old.rollback_token = applied_a.rollback_token;
++  CHECK(sf_prb_quota_rollback(&t, &old, T0).status == SF_QUOTA_ROLLBACK_SUPERSEDED);
++
++  sf_rollback_t good = wrong;
++  good.action_id = 93;
++  good.rollback_token = applied_b.rollback_token;
++  sf_quota_outcome_t rolled = sf_prb_quota_rollback(&t, &good, T0 + SEC);
++  CHECK(rolled.status == SF_QUOTA_ROLLED_BACK);
++  CHECK(rolled.previous_prb == 24 && rolled.applied_prb == 52);
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 1), T0 + SEC, NULL) == 52);
++
++  CHECK(sf_prb_quota_rollback(&t, &good, T0 + SEC).duplicate);
++
++  /* rolling back the first rule removes it entirely */
++  sf_rollback_t first = good;
++  first.action_id = 94;
++  first.target_action_id = 1;
++  first.rollback_token = applied_a.rollback_token;
++  CHECK(sf_prb_quota_rollback(&t, &first, T0 + SEC).status == SF_QUOTA_ROLLED_BACK);
++  CHECK(sf_prb_quota_lookup(&t, ue(1, 1), T0 + SEC, NULL) == 106);
++}
++
++static void test_table_full(void)
++{
++  sf_prb_quota_table_t t;
++  sf_prb_quota_init(&t, 7);
++  for (uint32_t sd = 1; sd <= SF_PRB_QUOTA_MAX_RULES; sd++) {
++    sf_prb_action_t a = action(sd, sd, 0, 24);
++    CHECK(sf_prb_quota_apply(&t, &a, T0).status == SF_QUOTA_APPLIED);
++  }
++  sf_prb_action_t extra = action(50, 9, 0, 24);
++  CHECK(sf_prb_quota_apply(&t, &extra, T0).status == SF_QUOTA_TABLE_FULL);
++  /* an expired slot is reclaimed */
++  CHECK(sf_prb_quota_apply(&t, &(sf_prb_action_t){0}, T0).status != SF_QUOTA_APPLIED);
++  sf_prb_action_t later = action(51, 9, 0, 24);
++  later.issued_at_ns = T0 + 31 * SEC;
++  CHECK(sf_prb_quota_apply(&t, &later, T0 + 31 * SEC).status == SF_QUOTA_APPLIED);
++}
++
++typedef struct {
++  sf_prb_quota_table_t *table;
++  atomic_bool *stop;
++  uint64_t bad;
++} reader_arg_t;
++
++static void *reader(void *p)
++{
++  reader_arg_t *arg = p;
++  while (!atomic_load(arg->stop)) {
++    uint16_t q = sf_prb_quota_lookup(arg->table, ue(1, 1), T0, NULL);
++    if (!sf_prb_quota_is_valid(q))
++      arg->bad++;
++  }
++  return NULL;
++}
++
++static void test_concurrent_readers_see_valid_quotas(void)
++{
++  sf_prb_quota_table_t t;
++  sf_prb_quota_init(&t, 7);
++  atomic_bool stop = false;
++  reader_arg_t arg = {.table = &t, .stop = &stop};
++  pthread_t th;
++  CHECK(pthread_create(&th, NULL, reader, &arg) == 0);
++  const uint16_t valid[] = {24, 52, 78, 106};
++  for (uint64_t i = 0; i < 20000; i++) {
++    sf_prb_action_t a = action(1000 + i, 1, 0, valid[i % 4]);
++    CHECK(sf_prb_quota_apply(&t, &a, T0).status == SF_QUOTA_APPLIED);
++  }
++  atomic_store(&stop, true);
++  pthread_join(th, NULL);
++  CHECK(arg.bad == 0);
++}
++
++int main(void)
++{
++  test_default_and_valid_range();
++  test_slices_and_rnti_do_not_leak();
++  test_unmapped_ue_counts();
++  test_expiry_returns_default();
++  test_ttl_and_staleness();
++  test_duplicate_and_conflict();
++  test_rollback();
++  test_table_full();
++  test_concurrent_readers_see_valid_quotas();
++  printf("prb_quota_test: all tests passed\n");
++  return 0;
++}
+-- 
+2.43.0
+

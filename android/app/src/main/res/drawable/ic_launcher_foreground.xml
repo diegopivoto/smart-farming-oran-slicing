@@ -1,0 +1,11 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- sun -->
+    <path android:fillColor="#F6C453" android:pathData="M68,38m-9,0a9,9 0,1 1,18 0a9,9 0,1 1,-18 0" />
+    <!-- hills -->
+    <path android:fillColor="#8CC56A" android:pathData="M24,66 Q40,56 54,62 T84,58 V84 H24Z" />
+    <path android:fillColor="#4E9A4F" android:pathData="M24,74 Q44,66 62,72 T84,70 V84 H24Z" />
+    <!-- sprout -->
+    <path android:fillColor="#FFFFFF" android:pathData="M53,62 V46 h2 V62z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M54,47 c0,-7 5,-11 12,-11 c0,7 -5,11 -12,11z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M54,51 c0,-5 -4,-9 -10,-9 c0,5 4,9 10,9z" />
+</vector>

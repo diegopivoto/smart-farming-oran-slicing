@@ -1,0 +1,56 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Superpowers execution ledger (task history is preserved by commits)
+.superpowers/
+
+# Local builds and generated outputs
+.build/
+build/
+android/.gradle/
+android/**/build/
+android/dist/
+android/local.properties
+android/.kotlin/
+.idea/
+*.apk
+*.aab
+
+# Runtime data and large model artifacts
+experiments/
+models/
+*.pt
+*.pth
+*.onnx
+*.parquet
+nrL1_stats.log
+nrMAC_stats.log
+nrRRC_stats.log
+
+# Secrets and private credentials
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.p12
+*.jks
+*.keystore
+
+# Editors and operating systems
+.vscode/
+*~
+.DS_Store
+
+# Smart Farming demo content media (regenerate: nice -n 19 python3 deployment/content/sf_content.py render)
+deployment/content/media/
+docs/paper/*/main.log
+docs/paper/*/main.aux
+docs/paper/*/main.out
+docs/paper/*/main.toc

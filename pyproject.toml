@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools==75.6.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-farming-oran"
+version = "0.1.0"
+description = "Safe end-to-end Smart Farming orchestration and O-RAN control"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "pydantic==2.10.4",
+  "SQLAlchemy==2.0.36",
+  "pyarrow==18.1.0",
+  "PyYAML==6.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.13.0",
+  "pytest==8.3.4",
+  "pytest-asyncio==0.25.0",
+  "ruff==0.8.4",
+]
+analysis = [
+  "matplotlib==3.9.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_mode = "strict"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["smartfarm"]
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*", "yaml"]
+ignore_missing_imports = true

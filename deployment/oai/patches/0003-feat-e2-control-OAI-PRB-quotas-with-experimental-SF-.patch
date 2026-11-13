@@ -1,0 +1,930 @@
+From 7ac155d3dd53500df142eeb827b22f5ee798f509 Mon Sep 17 00:00:00 2001
+From: Diego Pivoto <>
+Date: Mon, 2 Nov 2026 17:06:24 -0300
+Subject: [PATCH 3/6] feat(e2): control OAI PRB quotas with experimental SF
+ profile
+
+Carry the experimental E2SM-SF/0.1 text profile inside DL slice labels of
+FlexRIC's custom SLICE SM: control requests apply or roll back quotas and
+indications read back the live rules, latest outcomes, per-UE quota and
+scheduler counters (5 Hz, or on the next tick after a new outcome). Remote
+input never asserts; defects become REJECTED_* outcomes. The mono-gNB RAN
+function target swaps the random-data SLICE stub for this adapter.
+---
+ openair2/E2AP/RAN_FUNCTION/CMakeLists.txt     |  15 +-
+ .../RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c     | 237 +++++++++++++
+ .../RAN_FUNCTION/CUSTOMIZED/ran_func_sf.h     |  24 ++
+ .../CUSTOMIZED/smartfarm_sf_codec.c           | 329 ++++++++++++++++++
+ .../CUSTOMIZED/smartfarm_sf_codec.h           |  57 +++
+ .../CUSTOMIZED/tests/sf_codec_test.c          | 139 ++++++++
+ openair2/E2AP/RAN_FUNCTION/init_ran_func.c    |  16 +
+ 7 files changed, 814 insertions(+), 3 deletions(-)
+ create mode 100644 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c
+ create mode 100644 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.h
+ create mode 100644 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.c
+ create mode 100644 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.h
+ create mode 100644 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/tests/sf_codec_test.c
+
+diff --git a/openair2/E2AP/RAN_FUNCTION/CMakeLists.txt b/openair2/E2AP/RAN_FUNCTION/CMakeLists.txt
+index b5c3a57ee2..c4e2f6df58 100644
+--- a/openair2/E2AP/RAN_FUNCTION/CMakeLists.txt
++++ b/openair2/E2AP/RAN_FUNCTION/CMakeLists.txt
+@@ -75,14 +75,23 @@ add_library(e2_ran_func_du_cucp_cuup STATIC
+             CUSTOMIZED/ran_func_pdcp.c
+             CUSTOMIZED/ran_func_mac.c
+             CUSTOMIZED/ran_func_rlc.c
+-            CUSTOMIZED/ran_func_slice.c  # currently, not implemented; therefore, filling rnd data
+-            ../flexric/test/rnd/fill_rnd_data_slice.c
++            CUSTOMIZED/ran_func_sf.c     # Smart Farming E2SM-SF/0.1 over the custom SLICE SM
++            CUSTOMIZED/smartfarm_sf_codec.c
+             CUSTOMIZED/ran_func_tc.c     # currently, not implemented; therefore, filling rnd data
+             ../flexric/test/rnd/fill_rnd_data_tc.c
+             )
+ 
+ target_link_libraries(e2_ran_func_du_cucp_cuup PUBLIC asn1_nr_rrc nr_rrc asn1_nr_rrc_hdrs e2_time_obj kpm_ric_info_common_obj kpm_ric_info_obj 3gpp_derived_ie_obj e2sm_rc_ir_obj sm_common_ie_obj ds sm_common_enc_asn_obj_rc 3gpp_derived_ie_enc_asn_obj_rc)
+-target_compile_definitions(e2_ran_func_du_cucp_cuup PUBLIC ${E2AP_VERSION}  ${KPM_VERSION} NGRAN_GNB_DU NGRAN_GNB_CUCP NGRAN_GNB_CUUP)
++target_compile_definitions(e2_ran_func_du_cucp_cuup PUBLIC ${E2AP_VERSION}  ${KPM_VERSION} NGRAN_GNB_DU NGRAN_GNB_CUCP NGRAN_GNB_CUUP SMARTFARM_SF_PROFILE)
++
++if(ENABLE_TESTS)
++  add_executable(sf_codec_test CUSTOMIZED/tests/sf_codec_test.c CUSTOMIZED/smartfarm_sf_codec.c
++                 ${CMAKE_SOURCE_DIR}/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c)
++  target_include_directories(sf_codec_test PRIVATE ${CMAKE_SOURCE_DIR})
++  target_link_libraries(sf_codec_test PRIVATE pthread)
++  add_dependencies(tests sf_codec_test)
++  add_test(NAME sf_codec_test COMMAND sf_codec_test)
++endif()
+ 
+ # Current implementation:
+ # - we only have one executable nr-softmodem for 4 node types: DU, CU, gNB-mono, CU-CP
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c
+new file mode 100644
+index 0000000000..b5bf3b1041
+--- /dev/null
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c
+@@ -0,0 +1,237 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/*! \file ran_func_sf.c
++ * \brief Smart Farming per-slice DL PRB quota over the custom SLICE SM.
++ *
++ * Remote input is never asserted on: malformed or out-of-policy requests
++ * produce a REJECTED_* outcome that is returned in the control outcome
++ * diagnostic and published in the next indication.
++ */
++
++#include "ran_func_sf.h"
++#include "smartfarm_sf_codec.h"
++#include "openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h"
++#include "openair2/E2AP/flexric/src/util/time_now_us.h"
++
++#include <assert.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define SF_OUTCOME_RING 8
++#define SF_MAX_UE_REPORTS 16
++#define SF_SLICE_SCHED "SF"
++/* The SLICE SM subscribes at most every 10 ms; report the table at 5 Hz and
++ * right away (next tick) when a new outcome is pending. */
++#define SF_REPORT_PERIOD_NS 200000000ULL
++
++static pthread_mutex_t outcome_lock = PTHREAD_MUTEX_INITIALIZER;
++static char outcome_ring[SF_OUTCOME_RING][SF_CODEC_MAX_LABEL];
++static size_t outcome_next;
++static size_t outcome_len;
++static uint64_t outcome_seq; /* guarded by outcome_lock */
++static uint64_t reported_seq; /* guarded by outcome_lock */
++static uint64_t last_report_ns; /* guarded by outcome_lock */
++
++static sf_prb_quota_table_t *quota_table(void)
++{
++  if (RC.nrmac == NULL || RC.nrmac[0] == NULL)
++    return NULL;
++  return &RC.nrmac[0]->sf_prb_quotas;
++}
++
++static void remember_outcome(const char *label)
++{
++  pthread_mutex_lock(&outcome_lock);
++  snprintf(outcome_ring[outcome_next], SF_CODEC_MAX_LABEL, "%s", label);
++  outcome_next = (outcome_next + 1) % SF_OUTCOME_RING;
++  if (outcome_len < SF_OUTCOME_RING)
++    outcome_len++;
++  outcome_seq++;
++  pthread_mutex_unlock(&outcome_lock);
++}
++
++static bool report_due(uint64_t now_ns)
++{
++  pthread_mutex_lock(&outcome_lock);
++  const bool due = outcome_seq != reported_seq || now_ns - last_report_ns >= SF_REPORT_PERIOD_NS;
++  if (due) {
++    reported_seq = outcome_seq;
++    last_report_ns = now_ns;
++  }
++  pthread_mutex_unlock(&outcome_lock);
++  return due;
++}
++
++static bool is_success(const sf_quota_outcome_t *o)
++{
++  return o->status == SF_QUOTA_APPLIED || o->status == SF_QUOTA_ROLLED_BACK;
++}
++
++static sf_quota_outcome_t handle_request(const char *label, size_t len)
++{
++  sf_request_t req;
++  sf_quota_outcome_t out = {0};
++  sf_prb_quota_table_t *table = quota_table();
++  if (!sf_codec_parse_request(label, len, &req) || table == NULL) {
++    out.status = SF_QUOTA_REJECTED_MALFORMED;
++    out.action_id = req.action_id;
++    printf("[E2 Agent]: SF request rejected (%s)\n", table == NULL ? "MAC not ready" : req.error);
++    return out;
++  }
++  const uint64_t now_ns = sf_realtime_ns();
++  if (req.kind == SF_REQ_PRB_QUOTA)
++    out = sf_prb_quota_apply(table, &req.quota, now_ns);
++  else
++    out = sf_prb_quota_rollback(table, &req.rollback, now_ns);
++  return out;
++}
++
++sm_ag_if_ans_t write_ctrl_sf_sm(void const *data)
++{
++  sm_ag_if_ans_t ans = {.type = CTRL_OUTCOME_SM_AG_IF_ANS_V0};
++  ans.ctrl_out.type = SLICE_AGENT_IF_CTRL_ANS_V0;
++  ans.ctrl_out.slice.ans = SLICE_CTRL_OUT_ERROR;
++
++  char label[SF_CODEC_MAX_LABEL] = {0};
++  const slice_ctrl_req_data_t *req = data;
++  bool all_ok = req != NULL;
++  size_t handled = 0;
++
++  if (req != NULL && req->msg.type == SLICE_CTRL_SM_V0_ADD) {
++    const ul_dl_slice_conf_t *dl = &req->msg.u.add_mod_slice.dl;
++    for (uint32_t i = 0; i < dl->len_slices && dl->slices != NULL; i++) {
++      const fr_slice_t *s = &dl->slices[i];
++      sf_quota_outcome_t out = handle_request(s->label, s->len_label);
++      all_ok = all_ok && is_success(&out);
++      if (sf_codec_format_outcome(label, sizeof(label), &out, sf_realtime_ns()) > 0) {
++        remember_outcome(label);
++        printf("[E2 Agent]: SF %s\n", label);
++      }
++      handled++;
++    }
++  }
++  if (handled == 0) {
++    sf_quota_outcome_t out = {.status = SF_QUOTA_REJECTED_MALFORMED};
++    all_ok = false;
++    if (sf_codec_format_outcome(label, sizeof(label), &out, sf_realtime_ns()) > 0)
++      remember_outcome(label);
++    printf("[E2 Agent]: SF control without an ADD request carrying E2SM-SF labels\n");
++  }
++
++  ans.ctrl_out.slice.ans = all_ok ? SLICE_CTRL_OUT_OK : SLICE_CTRL_OUT_ERROR;
++  const size_t diag_len = strnlen(label, sizeof(label));
++  if (diag_len > 0) {
++    ans.ctrl_out.slice.diagnostic = malloc(diag_len);
++    if (ans.ctrl_out.slice.diagnostic != NULL) {
++      memcpy(ans.ctrl_out.slice.diagnostic, label, diag_len);
++      ans.ctrl_out.slice.len_diag = diag_len;
++    }
++  }
++  return ans;
++}
++
++static bool append_slice(fr_slice_t *slices, uint32_t *n, const char *label, uint16_t prb)
++{
++  const size_t len = strlen(label);
++  fr_slice_t *s = &slices[*n];
++  memset(s, 0, sizeof(*s));
++  s->id = *n;
++  s->label = malloc(len);
++  s->sched = malloc(sizeof(SF_SLICE_SCHED) - 1);
++  if (s->label == NULL || s->sched == NULL) {
++    free(s->label);
++    free(s->sched);
++    return false;
++  }
++  memcpy(s->label, label, len);
++  s->len_label = len;
++  memcpy(s->sched, SF_SLICE_SCHED, sizeof(SF_SLICE_SCHED) - 1);
++  s->len_sched = sizeof(SF_SLICE_SCHED) - 1;
++  /* the plain SLICE encoder only accepts concrete parameter types */
++  s->params.type = SLICE_ALG_SM_V0_STATIC;
++  s->params.u.sta.pos_low = 0;
++  s->params.u.sta.pos_high = prb > 0 ? prb - 1U : 0U;
++  (*n)++;
++  return true;
++}
++
++static nssai_t first_drb_nssai(const NR_UE_sched_ctrl_t *sched_ctrl)
++{
++  nssai_t nssai = {0, SF_PRB_QUOTA_NO_SD};
++  for (size_t j = 0; j < seq_arr_size(&sched_ctrl->lc_config); j++) {
++    const nr_lc_config_t *c = seq_arr_at(&sched_ctrl->lc_config, j);
++    if (c->lcid >= 4)
++      return c->nssai;
++  }
++  return nssai;
++}
++
++bool read_sf_sm(void *data)
++{
++  assert(data != NULL);
++  slice_ind_data_t *ind = (slice_ind_data_t *)data;
++  sf_prb_quota_table_t *table = quota_table();
++  if (table == NULL || !report_due(sf_realtime_ns()))
++    return false;
++
++  const uint32_t capacity = 1 + SF_PRB_QUOTA_MAX_RULES + SF_OUTCOME_RING + SF_MAX_UE_REPORTS;
++  fr_slice_t *slices = calloc(capacity, sizeof(*slices));
++  if (slices == NULL)
++    return false;
++  uint32_t n = 0;
++  char label[SF_CODEC_MAX_LABEL];
++  const uint64_t now_ns = sf_realtime_ns();
++
++  sf_prb_rule_snapshot_t rules[SF_PRB_QUOTA_MAX_RULES];
++  uint32_t version = 0;
++  const int n_rules = sf_prb_quota_snapshot(table, now_ns, rules, &version);
++  sf_quota_counters_snapshot_t counters = sf_prb_quota_counters(table);
++  if (sf_codec_format_counters(label, sizeof(label), &counters, version) > 0)
++    append_slice(slices, &n, label, SF_PRB_QUOTA_DEFAULT);
++  for (int i = 0; i < n_rules; i++)
++    if (sf_codec_format_rule(label, sizeof(label), &rules[i], version) > 0)
++      append_slice(slices, &n, label, rules[i].prb_quota);
++
++  pthread_mutex_lock(&outcome_lock);
++  for (size_t i = 0; i < outcome_len; i++) {
++    size_t idx = (outcome_next + SF_OUTCOME_RING - outcome_len + i) % SF_OUTCOME_RING;
++    append_slice(slices, &n, outcome_ring[idx], 0);
++  }
++  pthread_mutex_unlock(&outcome_lock);
++
++  gNB_MAC_INST *mac = RC.nrmac[0];
++  NR_SCHED_LOCK(&mac->sched_lock);
++  uint32_t ue_reports = 0;
++  UE_iterator (mac->UE_info.connected_ue_list, UE) {
++    if (ue_reports >= SF_MAX_UE_REPORTS)
++      break;
++    nssai_t nssai = first_drb_nssai(&UE->UE_sched_ctrl);
++    sf_prb_target_t target = {.sst = nssai.sst, .sd = nssai.sd, .rnti = UE->rnti};
++    sf_quota_meta_t meta;
++    uint16_t prb = sf_prb_quota_peek(table, target, now_ns, &meta);
++    if (sf_codec_format_ue(label, sizeof(label), UE->rnti, nssai.sst, nssai.sd, prb, meta.matched ? meta.action_id : 0) > 0
++        && append_slice(slices, &n, label, prb))
++      ue_reports++;
++  }
++  NR_SCHED_UNLOCK(&mac->sched_lock);
++
++  ind->msg.slice_conf.dl.slices = slices;
++  ind->msg.slice_conf.dl.len_slices = n;
++  ind->msg.slice_conf.dl.sched_name = malloc(sizeof(SF_SLICE_SCHED) - 1);
++  if (ind->msg.slice_conf.dl.sched_name != NULL) {
++    memcpy(ind->msg.slice_conf.dl.sched_name, SF_SLICE_SCHED, sizeof(SF_SLICE_SCHED) - 1);
++    ind->msg.slice_conf.dl.len_sched_name = sizeof(SF_SLICE_SCHED) - 1;
++  }
++  ind->msg.tstamp = time_now_us();
++  return true;
++}
++
++void read_sf_setup_sm(void *data)
++{
++  /* The SLICE SM agent fills its own RAN Function Definition. */
++  (void)data;
++}
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.h b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.h
+new file mode 100644
+index 0000000000..3f386df27c
+--- /dev/null
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.h
+@@ -0,0 +1,24 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/*! \file ran_func_sf.h
++ * \brief Smart Farming "E2SM-SF/0.1" handlers carried by FlexRIC's custom SLICE SM.
++ *
++ * Control: SLICE_CTRL_SM_V0_ADD whose DL slice labels hold E2SM-SF requests.
++ * Indication: DL slice labels report the effective quota table, the latest
++ * outcomes, per-UE quota readback and scheduler counters.
++ */
++
++#ifndef RAN_FUNC_SM_SF_READ_WRITE_AGENT_H
++#define RAN_FUNC_SM_SF_READ_WRITE_AGENT_H
++
++#include "openair2/E2AP/flexric/src/agent/../sm/sm_io.h"
++
++bool read_sf_sm(void *data);
++
++void read_sf_setup_sm(void *data);
++
++sm_ag_if_ans_t write_ctrl_sf_sm(void const *data);
++
++#endif
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.c b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.c
+new file mode 100644
+index 0000000000..27887dbb80
+--- /dev/null
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.c
+@@ -0,0 +1,329 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/*! \file smartfarm_sf_codec.c
++ * \brief Text codec of the experimental "E2SM-SF/0.1" profile (see header).
++ */
++
++#include "smartfarm_sf_codec.h"
++
++#include <inttypes.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++typedef enum {
++  K_ACTION_ID,
++  K_RUN_ID,
++  K_SST,
++  K_SD,
++  K_RNTI,
++  K_PRB,
++  K_TTL_MS,
++  K_ISSUED_AT_NS,
++  K_TARGET_ACTION_ID,
++  K_TOKEN,
++  K_END
++} sf_key_t;
++
++static const char *key_names[K_END] = {
++    [K_ACTION_ID] = "action_id",
++    [K_RUN_ID] = "run_id",
++    [K_SST] = "sst",
++    [K_SD] = "sd",
++    [K_RNTI] = "rnti",
++    [K_PRB] = "prb",
++    [K_TTL_MS] = "ttl_ms",
++    [K_ISSUED_AT_NS] = "issued_at_ns",
++    [K_TARGET_ACTION_ID] = "target_action_id",
++    [K_TOKEN] = "token",
++};
++
++#define BIT(k) (1U << (k))
++static const uint32_t quota_keys =
++    BIT(K_ACTION_ID) | BIT(K_RUN_ID) | BIT(K_SST) | BIT(K_SD) | BIT(K_RNTI) | BIT(K_PRB) | BIT(K_TTL_MS) | BIT(K_ISSUED_AT_NS);
++static const uint32_t rollback_keys =
++    BIT(K_ACTION_ID) | BIT(K_RUN_ID) | BIT(K_TARGET_ACTION_ID) | BIT(K_TOKEN) | BIT(K_TTL_MS) | BIT(K_ISSUED_AT_NS);
++
++static bool parse_dec(const char *s, uint64_t max, uint64_t *out)
++{
++  if (*s == '\0')
++    return false;
++  uint64_t v = 0;
++  for (; *s != '\0'; s++) {
++    if (*s < '0' || *s > '9')
++      return false;
++    uint64_t d = (uint64_t)(*s - '0');
++    if (v > (max - d) / 10)
++      return false;
++    v = v * 10 + d;
++  }
++  *out = v;
++  return true;
++}
++
++static int hex_digit(char c)
++{
++  if (c >= '0' && c <= '9')
++    return c - '0';
++  if (c >= 'a' && c <= 'f')
++    return c - 'a' + 10;
++  if (c >= 'A' && c <= 'F')
++    return c - 'A' + 10;
++  return -1;
++}
++
++/* Exactly `digits` hex characters (<= 16) into a 64-bit value. */
++static bool parse_hex_fixed(const char *s, size_t digits, uint64_t *out)
++{
++  if (strlen(s) != digits)
++    return false;
++  uint64_t v = 0;
++  for (size_t i = 0; i < digits; i++) {
++    int d = hex_digit(s[i]);
++    if (d < 0)
++      return false;
++    v = (v << 4) | (uint64_t)d;
++  }
++  *out = v;
++  return true;
++}
++
++static bool parse_run_id(const char *s, uint8_t run_id[SF_PRB_QUOTA_RUN_ID_LEN])
++{
++  if (strlen(s) != 2 * SF_PRB_QUOTA_RUN_ID_LEN)
++    return false;
++  for (int i = 0; i < SF_PRB_QUOTA_RUN_ID_LEN; i++) {
++    int hi = hex_digit(s[2 * i]);
++    int lo = hex_digit(s[2 * i + 1]);
++    if (hi < 0 || lo < 0)
++      return false;
++    run_id[i] = (uint8_t)((hi << 4) | lo);
++  }
++  return true;
++}
++
++static bool fail(sf_request_t *out, const char *fmt, ...)
++{
++  va_list ap;
++  va_start(ap, fmt);
++  vsnprintf(out->error, sizeof(out->error), fmt, ap);
++  va_end(ap);
++  out->kind = SF_REQ_INVALID;
++  return false;
++}
++
++static bool assign(sf_request_t *out, sf_request_kind_t kind, sf_key_t key, const char *value)
++{
++  uint64_t v = 0;
++  sf_prb_action_t *q = &out->quota;
++  sf_rollback_t *r = &out->rollback;
++  switch (key) {
++    case K_ACTION_ID:
++      if (!parse_dec(value, UINT64_MAX, &v))
++        return false;
++      out->action_id = v;
++      if (kind == SF_REQ_PRB_QUOTA)
++        q->action_id = v;
++      else
++        r->action_id = v;
++      return true;
++    case K_RUN_ID:
++      return parse_run_id(value, kind == SF_REQ_PRB_QUOTA ? q->run_id : r->run_id);
++    case K_SST:
++      if (!parse_dec(value, UINT8_MAX, &v))
++        return false;
++      q->target.sst = (uint8_t)v;
++      return true;
++    case K_SD:
++      if (!parse_hex_fixed(value, 6, &v))
++        return false;
++      q->target.sd = (uint32_t)v;
++      return true;
++    case K_RNTI:
++      if (!parse_dec(value, UINT16_MAX, &v))
++        return false;
++      q->target.rnti = (uint16_t)v;
++      return true;
++    case K_PRB:
++      if (!parse_dec(value, UINT16_MAX, &v))
++        return false;
++      q->prb_quota = (uint16_t)v;
++      return true;
++    case K_TTL_MS:
++      if (!parse_dec(value, UINT32_MAX, &v))
++        return false;
++      if (kind == SF_REQ_PRB_QUOTA)
++        q->ttl_ms = (uint32_t)v;
++      else
++        r->ttl_ms = (uint32_t)v;
++      return true;
++    case K_ISSUED_AT_NS:
++      if (!parse_dec(value, UINT64_MAX, &v))
++        return false;
++      if (kind == SF_REQ_PRB_QUOTA)
++        q->issued_at_ns = v;
++      else
++        r->issued_at_ns = v;
++      return true;
++    case K_TARGET_ACTION_ID:
++      if (!parse_dec(value, UINT64_MAX, &v))
++        return false;
++      r->target_action_id = v;
++      return true;
++    case K_TOKEN:
++      if (!parse_hex_fixed(value, 16, &v))
++        return false;
++      r->rollback_token = v;
++      return true;
++    default:
++      return false;
++  }
++}
++
++bool sf_codec_parse_request(const char *text, size_t len, sf_request_t *out)
++{
++  memset(out, 0, sizeof(*out));
++  if (text == NULL || len == 0)
++    return fail(out, "empty request");
++  size_t n = strnlen(text, len);
++  if (n >= SF_CODEC_MAX_LABEL)
++    return fail(out, "request longer than %d bytes", SF_CODEC_MAX_LABEL - 1);
++
++  char buf[SF_CODEC_MAX_LABEL];
++  memcpy(buf, text, n);
++  buf[n] = '\0';
++
++  sf_request_kind_t kind = SF_REQ_INVALID;
++  uint32_t seen = 0;
++  int index = 0;
++  char *save = NULL;
++  for (char *pair = strtok_r(buf, ";", &save); pair != NULL; pair = strtok_r(NULL, ";", &save), index++) {
++    char *eq = strchr(pair, '=');
++    if (eq == NULL)
++      return fail(out, "pair without '=': %.32s", pair);
++    *eq = '\0';
++    const char *key = pair;
++    const char *value = eq + 1;
++
++    if (index == 0) {
++      if (strcmp(key, "sf") != 0 || strcmp(value, SF_CODEC_VERSION) != 0)
++        return fail(out, "first pair must be sf=" SF_CODEC_VERSION);
++      continue;
++    }
++    if (index == 1) {
++      if (strcmp(key, "op") != 0)
++        return fail(out, "second pair must be op");
++      if (strcmp(value, "prb_quota") == 0)
++        kind = SF_REQ_PRB_QUOTA;
++      else if (strcmp(value, "rollback") == 0)
++        kind = SF_REQ_ROLLBACK;
++      else
++        return fail(out, "unknown op %.32s", value);
++      continue;
++    }
++
++    const uint32_t allowed = kind == SF_REQ_PRB_QUOTA ? quota_keys : rollback_keys;
++    sf_key_t k = K_END;
++    for (int i = 0; i < K_END; i++)
++      if (strcmp(key, key_names[i]) == 0)
++        k = (sf_key_t)i;
++    if (k == K_END || !(allowed & BIT(k)))
++      return fail(out, "unexpected key %.32s", key);
++    if (seen & BIT(k))
++      return fail(out, "duplicate key %s", key_names[k]);
++    if (!assign(out, kind, k, value))
++      return fail(out, "invalid value for %s", key_names[k]);
++    seen |= BIT(k);
++  }
++
++  if (kind == SF_REQ_INVALID)
++    return fail(out, "missing op");
++  const uint32_t required = kind == SF_REQ_PRB_QUOTA ? quota_keys : rollback_keys;
++  if ((seen & required) != required) {
++    for (int i = 0; i < K_END; i++)
++      if ((required & BIT(i)) && !(seen & BIT(i)))
++        return fail(out, "missing key %s", key_names[i]);
++  }
++  out->kind = kind;
++  return true;
++}
++
++static int finish(char *buf, size_t cap, int written)
++{
++  if (written < 0 || (size_t)written >= cap) {
++    if (cap > 0)
++      buf[0] = '\0';
++    return -1;
++  }
++  return written;
++}
++
++int sf_codec_format_outcome(char *buf, size_t cap, const sf_quota_outcome_t *o, uint64_t at_ns)
++{
++  int w = snprintf(buf,
++                   cap,
++                   "sf=" SF_CODEC_VERSION ";kind=outcome;action_id=%" PRIu64 ";status=%s;dup=%d;sst=%u;sd=%06" PRIx32
++                   ";rnti=%u;requested=%u;applied=%u;previous=%u;token=%016" PRIx64 ";expires_at_ns=%" PRIu64
++                   ";version=%u;at_ns=%" PRIu64,
++                   o->action_id,
++                   sf_quota_status_name(o->status),
++                   o->duplicate ? 1 : 0,
++                   o->target.sst,
++                   o->target.sd,
++                   o->target.rnti,
++                   o->requested_prb,
++                   o->applied_prb,
++                   o->previous_prb,
++                   o->rollback_token,
++                   o->expires_at_ns,
++                   o->table_version,
++                   at_ns);
++  return finish(buf, cap, w);
++}
++
++int sf_codec_format_rule(char *buf, size_t cap, const sf_prb_rule_snapshot_t *r, uint32_t version)
++{
++  int w = snprintf(buf,
++                   cap,
++                   "sf=" SF_CODEC_VERSION ";kind=rule;sst=%u;sd=%06" PRIx32 ";rnti=%u;prb=%u;action_id=%" PRIu64
++                   ";expires_at_ns=%" PRIu64 ";version=%u",
++                   r->target.sst,
++                   r->target.sd,
++                   r->target.rnti,
++                   r->prb_quota,
++                   r->action_id,
++                   r->expires_at_ns,
++                   version);
++  return finish(buf, cap, w);
++}
++
++int sf_codec_format_counters(char *buf, size_t cap, const sf_quota_counters_snapshot_t *c, uint32_t version)
++{
++  int w = snprintf(buf,
++                   cap,
++                   "sf=" SF_CODEC_VERSION ";kind=counters;lookups=%" PRIu64 ";unmapped=%" PRIu64 ";expired=%" PRIu64
++                   ";fallback=%" PRIu64 ";capped=%" PRIu64 ";bypass_retx=%" PRIu64 ";version=%u",
++                   c->lookups,
++                   c->unmapped,
++                   c->expired,
++                   c->fallback,
++                   c->capped_newtx,
++                   c->bypass_retx,
++                   version);
++  return finish(buf, cap, w);
++}
++
++int sf_codec_format_ue(char *buf, size_t cap, uint16_t rnti, uint8_t sst, uint32_t sd, uint16_t prb_quota, uint64_t action_id)
++{
++  int w = snprintf(buf,
++                   cap,
++                   "sf=" SF_CODEC_VERSION ";kind=ue;rnti=%u;sst=%u;sd=%06" PRIx32 ";prb=%u;action_id=%" PRIu64,
++                   rnti,
++                   sst,
++                   sd,
++                   prb_quota,
++                   action_id);
++  return finish(buf, cap, w);
++}
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.h b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.h
+new file mode 100644
+index 0000000000..dbed298223
+--- /dev/null
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.h
+@@ -0,0 +1,57 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/*! \file smartfarm_sf_codec.h
++ * \brief Text codec of the experimental Smart Farming profile "E2SM-SF/0.1".
++ *
++ * The profile rides inside the label of FlexRIC's custom SLICE service model:
++ * it is *not* O-RAN E2SM-RC nor a standardized slicing SM. A message is a
++ * sequence of "key=value" pairs separated by ';' whose first pair is
++ * "sf=0.1". Requests (xApp -> gNB) use "op=prb_quota" or "op=rollback";
++ * readback labels (gNB -> xApp) use "kind=rule|outcome|counters|ue".
++ * The full grammar is documented in smart-farming-oran/schemas/e2sm-sf-v0.1.md.
++ */
++
++#ifndef SMARTFARM_SF_CODEC_H
++#define SMARTFARM_SF_CODEC_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h"
++
++#define SF_CODEC_VERSION "0.1"
++#define SF_CODEC_MAX_LABEL 512
++
++typedef enum {
++  SF_REQ_INVALID = 0,
++  SF_REQ_PRB_QUOTA,
++  SF_REQ_ROLLBACK,
++} sf_request_kind_t;
++
++typedef struct {
++  sf_request_kind_t kind;
++  uint64_t action_id; /* best effort, also filled for invalid requests when decodable */
++  sf_prb_action_t quota;
++  sf_rollback_t rollback;
++  char error[96];
++} sf_request_t;
++
++/* Decodes a request label; returns false (kind = SF_REQ_INVALID, error set) on any defect. */
++bool sf_codec_parse_request(const char *text, size_t len, sf_request_t *out);
++
++/* Formatters return the number of characters written (excluding NUL) or -1 when truncated. */
++int sf_codec_format_outcome(char *buf, size_t cap, const sf_quota_outcome_t *outcome, uint64_t at_ns);
++int sf_codec_format_rule(char *buf, size_t cap, const sf_prb_rule_snapshot_t *rule, uint32_t version);
++int sf_codec_format_counters(char *buf, size_t cap, const sf_quota_counters_snapshot_t *counters, uint32_t version);
++int sf_codec_format_ue(char *buf,
++                       size_t cap,
++                       uint16_t rnti,
++                       uint8_t sst,
++                       uint32_t sd,
++                       uint16_t prb_quota,
++                       uint64_t action_id);
++
++#endif
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/tests/sf_codec_test.c b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/tests/sf_codec_test.c
+new file mode 100644
+index 0000000000..1efb78124c
+--- /dev/null
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/tests/sf_codec_test.c
+@@ -0,0 +1,139 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++#include "../smartfarm_sf_codec.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(cond)                                                    \
++  do {                                                                 \
++    if (!(cond)) {                                                     \
++      fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
++      exit(1);                                                         \
++    }                                                                  \
++  } while (0)
++
++#define RUN "0123456789abcdef0123456789abcdef"
++
++static bool parse(const char *text, sf_request_t *req)
++{
++  return sf_codec_parse_request(text, strlen(text), req);
++}
++
++static void test_quota_request(void)
++{
++  sf_request_t r;
++  CHECK(parse("sf=0.1;op=prb_quota;action_id=18446744073709551615;run_id=" RUN
++              ";sst=1;sd=000002;rnti=17921;prb=52;ttl_ms=30000;issued_at_ns=1793646912000000000",
++              &r));
++  CHECK(r.kind == SF_REQ_PRB_QUOTA);
++  CHECK(r.quota.action_id == UINT64_MAX && r.action_id == UINT64_MAX);
++  CHECK(r.quota.run_id[0] == 0x01 && r.quota.run_id[15] == 0xef);
++  CHECK(r.quota.target.sst == 1 && r.quota.target.sd == 2 && r.quota.target.rnti == 17921);
++  CHECK(r.quota.prb_quota == 52 && r.quota.ttl_ms == 30000);
++  CHECK(r.quota.issued_at_ns == 1793646912000000000ULL);
++}
++
++static void test_rollback_request(void)
++{
++  sf_request_t r;
++  CHECK(parse("sf=0.1;op=rollback;action_id=9;run_id=" RUN
++              ";target_action_id=8;token=00000000deadbeef;ttl_ms=5000;issued_at_ns=10",
++              &r));
++  CHECK(r.kind == SF_REQ_ROLLBACK);
++  CHECK(r.rollback.action_id == 9 && r.rollback.target_action_id == 8);
++  CHECK(r.rollback.rollback_token == 0xdeadbeefULL);
++  CHECK(r.rollback.ttl_ms == 5000 && r.rollback.issued_at_ns == 10);
++}
++
++static void test_rejections(void)
++{
++  const char *bad[] = {
++      "",
++      "op=prb_quota;sf=0.1", /* version must come first */
++      "sf=0.2;op=prb_quota;action_id=1;run_id=" RUN ";sst=1;sd=000001;rnti=0;prb=52;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=steal;action_id=1",
++      "sf=0.1;op=prb_quota;action_id=1;run_id=" RUN ";sst=1;sd=000001;rnti=0;prb=52;ttl_ms=1", /* missing */
++      "sf=0.1;op=prb_quota;action_id=1;run_id=" RUN ";sst=1;sd=000001;rnti=0;prb=52;ttl_ms=1;issued_at_ns=1;x=1",
++      "sf=0.1;op=prb_quota;action_id=1;action_id=2;run_id=" RUN ";sst=1;sd=000001;rnti=0;prb=52;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=prb_quota;action_id=-1;run_id=" RUN ";sst=1;sd=000001;rnti=0;prb=52;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=prb_quota;action_id=1;run_id=xyz;sst=1;sd=000001;rnti=0;prb=52;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=prb_quota;action_id=1;run_id=" RUN ";sst=256;sd=000001;rnti=0;prb=52;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=prb_quota;action_id=1;run_id=" RUN ";sst=1;sd=1000000;rnti=0;prb=52;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=prb_quota;action_id=1;run_id=" RUN ";sst=1;sd=00000g;rnti=0;prb=52;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=prb_quota;action_id=1;run_id=" RUN ";sst=1;sd=000001;rnti=65536;prb=52;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=prb_quota;action_id=1;run_id=" RUN ";sst=1;sd=000001;rnti=0;prb=52x;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=prb_quota;action_id=1;run_id=" RUN ";sst=1;sd=000001;rnti=0;prb=;ttl_ms=1;issued_at_ns=1",
++      "sf=0.1;op=rollback;action_id=9;run_id=" RUN ";target_action_id=8;token=xyz;ttl_ms=5000;issued_at_ns=10",
++  };
++  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
++    sf_request_t r;
++    if (parse(bad[i], &r)) {
++      fprintf(stderr, "accepted malformed request #%zu: %s\n", i, bad[i]);
++      exit(1);
++    }
++    CHECK(r.kind == SF_REQ_INVALID);
++    CHECK(r.error[0] != '\0');
++  }
++
++  /* not NUL terminated within len and oversize */
++  char big[SF_CODEC_MAX_LABEL + 10];
++  memset(big, 'a', sizeof(big));
++  sf_request_t r;
++  CHECK(!sf_codec_parse_request(big, sizeof(big), &r));
++
++  /* action id is still reported for a decodable-but-invalid request */
++  CHECK(!parse("sf=0.1;op=prb_quota;action_id=77;run_id=" RUN ";sst=1", &r));
++  CHECK(r.action_id == 77);
++}
++
++static void test_formatters(void)
++{
++  char buf[SF_CODEC_MAX_LABEL];
++  sf_quota_outcome_t o = {
++      .status = SF_QUOTA_APPLIED,
++      .duplicate = true,
++      .action_id = 5,
++      .target = {.sst = 1, .sd = 3, .rnti = 0},
++      .requested_prb = 24,
++      .applied_prb = 24,
++      .previous_prb = 106,
++      .rollback_token = 0xabcdefULL,
++      .expires_at_ns = 99,
++      .table_version = 4,
++  };
++  CHECK(sf_codec_format_outcome(buf, sizeof(buf), &o, 1234) > 0);
++  CHECK(strcmp(buf,
++               "sf=0.1;kind=outcome;action_id=5;status=APPLIED;dup=1;sst=1;sd=000003;rnti=0;requested=24;"
++               "applied=24;previous=106;token=0000000000abcdef;expires_at_ns=99;version=4;at_ns=1234")
++        == 0);
++
++  sf_prb_rule_snapshot_t rule = {.target = {.sst = 1, .sd = 1, .rnti = 0}, .prb_quota = 78, .expires_at_ns = 7, .action_id = 3};
++  CHECK(sf_codec_format_rule(buf, sizeof(buf), &rule, 2) > 0);
++  CHECK(strcmp(buf, "sf=0.1;kind=rule;sst=1;sd=000001;rnti=0;prb=78;action_id=3;expires_at_ns=7;version=2") == 0);
++
++  sf_quota_counters_snapshot_t c = {.lookups = 1, .unmapped = 2, .expired = 3, .fallback = 4, .capped_newtx = 5, .bypass_retx = 6};
++  CHECK(sf_codec_format_counters(buf, sizeof(buf), &c, 9) > 0);
++  CHECK(strcmp(buf,
++               "sf=0.1;kind=counters;lookups=1;unmapped=2;expired=3;fallback=4;capped=5;bypass_retx=6;version=9")
++        == 0);
++
++  CHECK(sf_codec_format_ue(buf, sizeof(buf), 0x4601, 1, 1, 52, 3) > 0);
++  CHECK(strcmp(buf, "sf=0.1;kind=ue;rnti=17921;sst=1;sd=000001;prb=52;action_id=3") == 0);
++
++  char tiny[8];
++  CHECK(sf_codec_format_ue(tiny, sizeof(tiny), 0x4601, 1, 1, 52, 3) == -1);
++}
++
++int main(void)
++{
++  test_quota_request();
++  test_rollback_request();
++  test_rejections();
++  test_formatters();
++  printf("sf_codec_test: all tests passed\n");
++  return 0;
++}
+diff --git a/openair2/E2AP/RAN_FUNCTION/init_ran_func.c b/openair2/E2AP/RAN_FUNCTION/init_ran_func.c
+index 314cfa6e70..db93243206 100644
+--- a/openair2/E2AP/RAN_FUNCTION/init_ran_func.c
++++ b/openair2/E2AP/RAN_FUNCTION/init_ran_func.c
+@@ -9,8 +9,12 @@
+ #if defined (NGRAN_GNB_DU)
+ #include "CUSTOMIZED/ran_func_mac.h"
+ #include "CUSTOMIZED/ran_func_rlc.h"
++#if defined(SMARTFARM_SF_PROFILE)
++#include "CUSTOMIZED/ran_func_sf.h"
++#else
+ #include "CUSTOMIZED/ran_func_slice.h"
+ #endif
++#endif
+ #if defined (NGRAN_GNB_CUUP)
+ #include "CUSTOMIZED/ran_func_tc.h"
+ #include "CUSTOMIZED/ran_func_gtp.h"
+@@ -26,7 +30,11 @@ void init_read_ind_tbl(read_ind_fp (*read_ind_tbl)[SM_AGENT_IF_READ_V0_END])
+   #if defined (NGRAN_GNB_DU)
+   (*read_ind_tbl)[MAC_STATS_V0] =  read_mac_sm;
+   (*read_ind_tbl)[RLC_STATS_V0] =  read_rlc_sm ;
++#if defined(SMARTFARM_SF_PROFILE)
++  (*read_ind_tbl)[SLICE_STATS_V0] = read_sf_sm;
++#else
+   (*read_ind_tbl)[SLICE_STATS_V0] = read_slice_sm ;
++#endif
+   #endif
+   #if defined (NGRAN_GNB_CUUP)
+   (*read_ind_tbl)[TC_STATS_V0] = read_tc_sm ;
+@@ -44,7 +52,11 @@ void init_read_setup_tbl(read_e2_setup_fp (*read_setup_tbl)[SM_AGENT_IF_E2_SETUP
+   #if defined (NGRAN_GNB_DU)
+   (*read_setup_tbl)[MAC_AGENT_IF_E2_SETUP_ANS_V0] =  read_mac_setup_sm;
+   (*read_setup_tbl)[RLC_AGENT_IF_E2_SETUP_ANS_V0] =  read_rlc_setup_sm ;
++#if defined(SMARTFARM_SF_PROFILE)
++  (*read_setup_tbl)[SLICE_AGENT_IF_E2_SETUP_ANS_V0] = read_sf_setup_sm;
++#else
+   (*read_setup_tbl)[SLICE_AGENT_IF_E2_SETUP_ANS_V0] =  read_slice_setup_sm ;
++#endif
+   #endif
+   #if defined (NGRAN_GNB_CUUP)
+   (*read_setup_tbl)[TC_AGENT_IF_E2_SETUP_ANS_V0] =  read_tc_setup_sm ;
+@@ -62,7 +74,11 @@ void init_write_ctrl( write_ctrl_fp (*write_ctrl_tbl)[SM_AGENT_IF_WRITE_CTRL_V0_
+   #if defined (NGRAN_GNB_DU)
+   (*write_ctrl_tbl)[MAC_CTRL_REQ_V0] = write_ctrl_mac_sm;
+   (*write_ctrl_tbl)[RLC_CTRL_REQ_V0] = write_ctrl_rlc_sm;
++#if defined(SMARTFARM_SF_PROFILE)
++  (*write_ctrl_tbl)[SLICE_CTRL_REQ_V0] = write_ctrl_sf_sm;
++#else
+   (*write_ctrl_tbl)[SLICE_CTRL_REQ_V0] = write_ctrl_slice_sm;
++#endif
+   #endif
+   #if defined (NGRAN_GNB_CUUP)
+   (*write_ctrl_tbl)[TC_CTRL_REQ_V0] = write_ctrl_tc_sm;
+-- 
+2.43.0
+

@@ -1,0 +1,410 @@
+From 7525bc050a6ce917173a0399a5042980f90dce55 Mon Sep 17 00:00:00 2001
+From: Diego Pivoto <>
+Date: Mon, 2 Nov 2026 17:06:24 -0300
+Subject: [PATCH 2/6] feat(nr-mac): enforce per-slice downlink PRB quota
+
+Look up the slice quota for every DL candidate after collection and cap the
+new-data allocation of the proportional-fair policy to it; HARQ
+retransmissions keep their size and are counted as quota bypasses. Adds a
+counter-free peek for readback, a MALFORMED status for the E2 adapter, and
+nr_dlbench -Q/-q options with CTest scenarios for 24/52/78/106 PRBs and the
+retransmission bypass.
+---
+ .../LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c   | 12 ++++
+ .../gNB_scheduler_dlsch_default_policies.c    | 10 +++-
+ openair2/LAYER2/NR_MAC_gNB/main.c             |  1 +
+ openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h       |  6 ++
+ .../LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c   | 28 ++++++++--
+ .../LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h   |  4 ++
+ tests/nrdlbench/CMakeLists.txt                |  7 +++
+ tests/nrdlbench/dlbench.c                     | 56 ++++++++++++++++++-
+ tests/nrdlbench/nr-dlbench-sf-quota-test.sh   | 51 +++++++++++++++++
+ 9 files changed, 166 insertions(+), 9 deletions(-)
+ create mode 100755 tests/nrdlbench/nr-dlbench-sf-quota-test.sh
+
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
+index 7589603ccb..9dac85a199 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
+@@ -718,6 +718,18 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
+   if (n == 0)
+     return;
+ 
++  /* Step 1b: Smart Farming per-slice PRB quota. A retransmission keeps its
++   * original size; the quota only caps new data in the RB-allocation policy. */
++  const uint64_t quota_now_ns = sf_realtime_ns();
++  FOR_EACH_CANDIDATE(cand, candidates, n) {
++    sf_prb_target_t target = {.sst = cand->nssai.sst, .sd = cand->nssai.sd, .rnti = cand->rnti};
++    sf_quota_meta_t meta;
++    cand->prb_quota = sf_prb_quota_lookup(&mac->sf_prb_quotas, target, quota_now_ns, &meta);
++    cand->prb_quota_action_id = meta.matched ? meta.action_id : 0;
++    if (cand->is_retx && cand->retx_rbSize > cand->prb_quota)
++      sf_prb_quota_count_bypass_retx(&mac->sf_prb_quotas);
++  }
++
+   /* Step 2: RI/PMI selection — sets sched_pdsch.nrOfLayers and pm_index per candidate */
+   mac->dl_ri_pmi_select(cell, candidates, n);
+ 
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch_default_policies.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch_default_policies.c
+index 9d765c8e8b..dc8ea20963 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch_default_policies.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch_default_policies.c
+@@ -268,6 +268,8 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
+                                               &cand->sched_pdsch.tda_info,
+                                               cand->sched_pdsch.nrOfLayers);
+     const int oh = 3 * 4 + (cand->UE->UE_sched_ctrl.ta_apply ? 2 : 0);
++    /* Smart Farming slice quota caps new data only (0 = no quota assigned) */
++    const int cand_max_rb = cand->prb_quota > 0 ? min(max_rbSize, cand->prb_quota) : max_rbSize;
+     uint32_t tbs;
+     nr_find_nb_rb(Qm,
+                   R,
+@@ -276,8 +278,8 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
+                   cand->sched_pdsch.tda_info.nrOfSymbols,
+                   dmrs.N_PRB_DMRS * dmrs.N_DMRS_SLOT,
+                   cand->pending_bytes + oh,
+-                  min_rbSize,
+-                  max_rbSize,
++                  min(min_rbSize, cand_max_rb),
++                  cand_max_rb,
+                   &tbs,
+                   &rbs_ue[j]);
+     if (n < n_remain_ue) {
+@@ -305,6 +307,10 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
+       excess_total_rbs -= excess_ack;
+       DevAssert(excess_total_rbs >= 0);
+     }
++    /* rbs_ue[j] was already bounded by the quota in nr_find_nb_rb(), so rb_req
++     * never exceeds it; count slots where the quota was the binding limit. */
++    if (cand->prb_quota > 0 && rbs_ue[j] >= cand->prb_quota && cand->prb_quota < cand->bwp_size)
++      sf_prb_quota_count_capped(&params->mac->sf_prb_quotas);
+     int rbStart, rbSize;
+     uint16_t *vrb_map = params->vrb_map[cand->alloc_beam_idx];
+     if (!get_rb_alloc(min_rbSize, rb_req, cand->bwp_start, cand->bwp_size, vrb_map, cand->alloc_slbitmap, &rbStart, &rbSize))
+diff --git a/openair2/LAYER2/NR_MAC_gNB/main.c b/openair2/LAYER2/NR_MAC_gNB/main.c
+index 0366875582..d05c0e1851 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/main.c
++++ b/openair2/LAYER2/NR_MAC_gNB/main.c
+@@ -304,6 +304,7 @@ void mac_top_init_gNB(ngran_node_t node_type,
+       RC.nrmac[i]->print_ue_stats = true;
+ 
+       pthread_mutex_init(&RC.nrmac[i]->sched_lock, NULL);
++      sf_prb_quota_init(&RC.nrmac[i]->sf_prb_quotas, sf_realtime_ns());
+ 
+       uid_linear_allocator_init(&RC.nrmac[i]->UE_info.uid_allocator);
+ 
+diff --git a/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h b/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
+index f7054f746b..182edd6fa5 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
++++ b/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
+@@ -23,6 +23,7 @@
+ #include "common/utils/ds/spsc_q.h"
+ #include "openair2/LAYER2/nr_rlc/nr_rlc_configuration.h"
+ #include "openair2/LAYER2/NR_MAC_gNB/nr_pos_ue_context.h"
++#include "openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h"
+ 
+ #define NR_SCHED_LOCK(lock)                                        \
+   do {                                                             \
+@@ -962,6 +963,8 @@ struct nr_dl_candidate {
+   uint64_t fiveQI; ///< 5QI from first DRB's QoS config (0 if none)
+   int priority; ///< LC priority from first DRB (lower = higher priority, 0 if none)
+   nssai_t nssai; ///< slice/service type/differentiator from first DRB
++  uint16_t prb_quota; ///< max PRBs for new data (Smart Farming slice quota, 106 = unlimited)
++  uint64_t prb_quota_action_id; ///< E2 action that installed prb_quota, 0 = default
+ 
+   bool skipped; ///< true if dropped by TDA/beam select (skip in downstream stages)
+   bool scheduled; ///< true if accepted by the RB-allocation policy
+@@ -1378,6 +1381,9 @@ typedef struct gNB_MAC_INST_s {
+ 
+   dlul_mac_stats_t mac_stats;
+ 
++  /// per-slice DL PRB quotas, written by the E2 agent and read by the DL scheduler
++  sf_prb_quota_table_t sf_prb_quotas;
++
+   seq_arr_t pos_act_ue_arr;
+   positioning_measurement_info_t pos_meas_info;
+   positioning_config_t *positioning_config;
+diff --git a/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c b/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c
+index 52c91fe21d..90027930cc 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c
++++ b/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c
+@@ -46,6 +46,7 @@ const char *sf_quota_status_name(sf_quota_status_t status)
+       [SF_QUOTA_ROLLBACK_UNKNOWN] = "ROLLBACK_UNKNOWN",
+       [SF_QUOTA_ROLLBACK_TOKEN] = "ROLLBACK_TOKEN",
+       [SF_QUOTA_ROLLBACK_SUPERSEDED] = "ROLLBACK_SUPERSEDED",
++      [SF_QUOTA_REJECTED_MALFORMED] = "REJECTED_MALFORMED",
+   };
+   return status < SF_QUOTA_STATUS_END && names[status] != NULL ? names[status] : "UNKNOWN";
+ }
+@@ -253,15 +254,21 @@ static uint16_t resolve(const rule_view_t views[SF_PRB_QUOTA_MAX_RULES],
+   return chosen->quota;
+ }
+ 
+-uint16_t sf_prb_quota_lookup(sf_prb_quota_table_t *table, sf_prb_target_t target, uint64_t now_ns, sf_quota_meta_t *meta)
++static uint16_t lookup_internal(sf_prb_quota_table_t *table,
++                                sf_prb_target_t target,
++                                uint64_t now_ns,
++                                sf_quota_meta_t *meta,
++                                bool count)
+ {
+   sf_quota_meta_t local = {0};
+   sf_quota_meta_t *m = meta != NULL ? meta : &local;
+   memset(m, 0, sizeof(*m));
+-  atomic_fetch_add_explicit(&table->counters.lookups, 1, memory_order_relaxed);
++  if (count)
++    atomic_fetch_add_explicit(&table->counters.lookups, 1, memory_order_relaxed);
+ 
+   if (target.sst == 0 && target.sd == SF_PRB_QUOTA_NO_SD) {
+-    atomic_fetch_add_explicit(&table->counters.unmapped, 1, memory_order_relaxed);
++    if (count)
++      atomic_fetch_add_explicit(&table->counters.unmapped, 1, memory_order_relaxed);
+     return SF_PRB_QUOTA_DEFAULT;
+   }
+ 
+@@ -279,16 +286,27 @@ uint16_t sf_prb_quota_lookup(sf_prb_quota_table_t *table, sf_prb_target_t target
+       continue;
+     uint16_t quota = resolve(views, target, now_ns, m);
+     m->table_version = version;
+-    if (m->expired)
++    if (count && m->expired)
+       atomic_fetch_add_explicit(&table->counters.expired, 1, memory_order_relaxed);
+     /* defensive: a torn view can never yield an out-of-range quota */
+     return sf_prb_quota_is_valid(quota) ? quota : SF_PRB_QUOTA_DEFAULT;
+   }
+   m->fallback = true;
+-  atomic_fetch_add_explicit(&table->counters.fallback, 1, memory_order_relaxed);
++  if (count)
++    atomic_fetch_add_explicit(&table->counters.fallback, 1, memory_order_relaxed);
+   return SF_PRB_QUOTA_DEFAULT;
+ }
+ 
++uint16_t sf_prb_quota_lookup(sf_prb_quota_table_t *table, sf_prb_target_t target, uint64_t now_ns, sf_quota_meta_t *meta)
++{
++  return lookup_internal(table, target, now_ns, meta, true);
++}
++
++uint16_t sf_prb_quota_peek(sf_prb_quota_table_t *table, sf_prb_target_t target, uint64_t now_ns, sf_quota_meta_t *meta)
++{
++  return lookup_internal(table, target, now_ns, meta, false);
++}
++
+ /* Effective quota for a target, read by the (single) writer under lock. */
+ static uint16_t effective_locked(sf_prb_quota_table_t *t, sf_prb_target_t target, uint64_t now_ns, uint64_t *expires)
+ {
+diff --git a/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h b/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h
+index dbc96eb326..6356116e4f 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h
++++ b/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.h
+@@ -43,6 +43,7 @@ typedef enum {
+   SF_QUOTA_ROLLBACK_UNKNOWN,
+   SF_QUOTA_ROLLBACK_TOKEN,
+   SF_QUOTA_ROLLBACK_SUPERSEDED,
++  SF_QUOTA_REJECTED_MALFORMED, /* request could not be decoded (set by the E2 adapter) */
+   SF_QUOTA_STATUS_END
+ } sf_quota_status_t;
+ 
+@@ -161,6 +162,9 @@ sf_quota_outcome_t sf_prb_quota_apply(sf_prb_quota_table_t *table, const sf_prb_
+ 
+ uint16_t sf_prb_quota_lookup(sf_prb_quota_table_t *table, sf_prb_target_t target, uint64_t now_ns, sf_quota_meta_t *meta);
+ 
++/* Same as lookup but leaves the scheduler counters untouched (for readback). */
++uint16_t sf_prb_quota_peek(sf_prb_quota_table_t *table, sf_prb_target_t target, uint64_t now_ns, sf_quota_meta_t *meta);
++
+ sf_quota_outcome_t sf_prb_quota_rollback(sf_prb_quota_table_t *table, const sf_rollback_t *rollback, uint64_t now_ns);
+ 
+ /* Copies live (non-expired) rules; returns how many were written. */
+diff --git a/tests/nrdlbench/CMakeLists.txt b/tests/nrdlbench/CMakeLists.txt
+index 505bf35a82..875b5443e5 100644
+--- a/tests/nrdlbench/CMakeLists.txt
++++ b/tests/nrdlbench/CMakeLists.txt
+@@ -22,4 +22,11 @@ if(ENABLE_TESTS)
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/nr-dlbench-functional-test.sh $<TARGET_FILE:nr_dlbench> -A 0)
+   add_test(NAME nr_dlbench_am_functional_test
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/nr-dlbench-functional-test.sh $<TARGET_FILE:nr_dlbench> -A 50)
++  # Smart Farming per-slice PRB quota on the real DL scheduler
++  foreach(quota 24 52 78 106)
++    add_test(NAME nrdlbench_sf_quota_${quota}
++             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/nr-dlbench-sf-quota-test.sh $<TARGET_FILE:nr_dlbench> ${quota})
++  endforeach()
++  add_test(NAME nrdlbench_sf_quota_retx_bypass
++           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/nr-dlbench-sf-quota-test.sh $<TARGET_FILE:nr_dlbench> 24 retx)
+ endif()
+diff --git a/tests/nrdlbench/dlbench.c b/tests/nrdlbench/dlbench.c
+index d1c73e7f5c..aa3c925728 100644
+--- a/tests/nrdlbench/dlbench.c
++++ b/tests/nrdlbench/dlbench.c
+@@ -229,6 +229,8 @@ int main(int argc, char **argv)
+   char *csv_filename = NULL;
+   int print_perf = 0;
+   double target_bler = 0.0;
++  int sf_quota = 0; /* Smart Farming slice PRB quota, 0 = none */
++  int sf_quota_from_slot = 0; /* first measured DL slot with the quota active */
+ 
+   if ((uniqCfg = load_configmodule(argc, argv, CONFIG_ENABLECMDLINEONLY)) == 0) {
+     printf("Error: configuration module init failed\n");
+@@ -237,7 +239,7 @@ int main(int argc, char **argv)
+ 
+   int c;
+   /* keep options in alphabetical order */
+-  while ((c = getopt(argc, argv, "--:O:A:B:e:L:m:n:PR:u:X:Z:h")) != -1) {
++  while ((c = getopt(argc, argv, "--:O:A:B:e:L:m:n:PQ:q:R:u:X:Z:h")) != -1) {
+     if (c == 1 || c == '-' || c == 'O')
+       continue;
+     switch (c) {
+@@ -263,6 +265,12 @@ int main(int argc, char **argv)
+         print_perf = 1;
+         cpu_meas_enabled = 1;
+         break;
++      case 'Q':
++        sf_quota = atoi(optarg);
++        break;
++      case 'q':
++        sf_quota_from_slot = atoi(optarg);
++        break;
+       case 'R':
+         N_RB_DL = atoi(optarg);
+         break;
+@@ -286,6 +294,8 @@ int main(int argc, char **argv)
+         printf("  -m <numerology>  Numerology index (default 1 = 30kHz)\n");
+         printf("  -n <num_slots>   Number of DL slots to benchmark (default 100)\n");
+         printf("  -P               Print PHY performance counters\n");
++        printf("  -Q <prb>         Smart Farming slice PRB quota for new data (24/52/78/106)\n");
++        printf("  -q <slot>        First measured DL slot where the -Q quota is active (default 0)\n");
+         printf("  -R <N_RB_DL>     Number of DL resource blocks (default 106)\n");
+         printf("  -u <num_ues>     Number of UEs (default 1, max %d)\n", MAX_MOBILES_PER_GNB);
+         printf("  -X <threads>     gNB thread pool config (default 'n' = no threads)\n");
+@@ -441,6 +451,11 @@ int main(int argc, char **argv)
+     /* Set UE channel quality so the scheduler picks a high MCS */
+     NR_UE_sched_ctrl_t *sc = &UE_info->UE_sched_ctrl;
+     sc->dl_max_mcs = bench_target_mcs;
++    for (int l = 0; l < seq_arr_size(&sc->lc_config); l++) {
++      nr_lc_config_t *lc = seq_arr_at(&sc->lc_config, l);
++      if (lc->lcid >= 4)
++        lc->nssai = (nssai_t){.sst = 1, .sd = 1};
++    }
+ 
+     printf("  UE %3d: rnti=%04x, BWP size=%d\n", u, rnti, UE_info->current_DL_BWP.BWPSize);
+   }
+@@ -492,9 +507,25 @@ int main(int argc, char **argv)
+   int slot = 0;
+   int dl_iter = 0; /* counts DL slots measured */
+ 
++  int sf_max_new_rb = 0, sf_max_retx_rb = 0, sf_new_pdsch = 0, sf_retx_pdsch = 0;
++  bool sf_quota_active = false;
++  uint64_t sf_action_id = 1;
+   while (dl_iter < n_slots && !stop) {
+     bool is_dl = is_dl_slot(slot, &frame_structure);
+ 
++    /* Smart Farming quota: install (and keep refreshing) once the start slot is reached */
++    if (sf_quota > 0 && dl_iter >= sf_quota_from_slot && (!sf_quota_active || dl_iter % 100 == 0)) {
++      sf_prb_action_t a = {.action_id = sf_action_id++,
++                           .target = {.sst = 1, .sd = 1, .rnti = 0},
++                           .prb_quota = sf_quota,
++                           .ttl_ms = 30000,
++                           .issued_at_ns = sf_realtime_ns()};
++      memset(a.run_id, 0x5f, sizeof(a.run_id));
++      sf_quota_outcome_t o = sf_prb_quota_apply(&gNB_mac->sf_prb_quotas, &a, sf_realtime_ns());
++      AssertFatal(o.status == SF_QUOTA_APPLIED, "quota %d rejected: %s\n", sf_quota, sf_quota_status_name(o.status));
++      sf_quota_active = true;
++    }
++
+     /* ── Pre-slot: inject synthetic UE state (every slot) ── */
+ 
+     /* 1) Simulate HARQ feedback: ACK or NACK based on target_bler */
+@@ -547,8 +578,18 @@ int main(int argc, char **argv)
+     if (is_dl) {
+       int n_pdsch = 0;
+       for (int p = 0; p < sched_rsp->DL_req.dl_tti_request_body.nPDUs; p++) {
+-        if (sched_rsp->DL_req.dl_tti_request_body.dl_tti_pdu_list[p].PDUType == NFAPI_NR_DL_TTI_PDSCH_PDU_TYPE)
++        if (sched_rsp->DL_req.dl_tti_request_body.dl_tti_pdu_list[p].PDUType == NFAPI_NR_DL_TTI_PDSCH_PDU_TYPE) {
+           n_pdsch++;
++          const nfapi_nr_dl_tti_pdsch_pdu_rel15_t *pdsch =
++              &sched_rsp->DL_req.dl_tti_request_body.dl_tti_pdu_list[p].pdsch_pdu.pdsch_pdu_rel15;
++          if (sf_quota_active && pdsch->rvIndex[0] == 0) {
++            sf_new_pdsch++;
++            sf_max_new_rb = max(sf_max_new_rb, pdsch->rbSize);
++          } else if (sf_quota_active) {
++            sf_retx_pdsch++;
++            sf_max_retx_rb = max(sf_max_retx_rb, pdsch->rbSize);
++          }
++        }
+       }
+ 
+       phy_procedures_gNB_TX(gNB, &sched_rsp->DL_req, &sched_rsp->TX_req, &sched_rsp->UL_dci_req, frame, slot);
+@@ -678,6 +719,17 @@ int main(int argc, char **argv)
+   free(sched_rsp);
+   free(csv_filename);
+ 
++  if (sf_quota > 0) {
++    sf_quota_counters_snapshot_t qc = sf_prb_quota_counters(&gNB_mac->sf_prb_quotas);
++    printf("\nsmartfarm_quota quota=%d new_pdsch=%d max_new_rb=%d retx_pdsch=%d max_retx_rb=%d "
++           "capped=%lu bypass_retx=%lu lookups=%lu unmapped=%lu\n",
++           sf_quota, sf_new_pdsch, sf_max_new_rb, sf_retx_pdsch, sf_max_retx_rb,
++           qc.capped_newtx, qc.bypass_retx, qc.lookups, qc.unmapped);
++    if (sf_max_new_rb > sf_quota) {
++      printf("FAIL: new transmission used %d RBs above quota %d\n", sf_max_new_rb, sf_quota);
++      return 3;
++    }
++  }
+   printf("\nDone.\n");
+   return 0;
+ }
+diff --git a/tests/nrdlbench/nr-dlbench-sf-quota-test.sh b/tests/nrdlbench/nr-dlbench-sf-quota-test.sh
+new file mode 100755
+index 0000000000..5c0692ac0d
+--- /dev/null
++++ b/tests/nrdlbench/nr-dlbench-sf-quota-test.sh
+@@ -0,0 +1,51 @@
++#!/bin/bash
++# SPDX-License-Identifier: LicenseRef-CSSL-1.0
++#
++# Smart Farming slice PRB quota scenarios on the real DL scheduler.
++# usage: nr-dlbench-sf-quota-test.sh <nr_dlbench> <quota> [retx]
++#   quota: new transmissions must never exceed it; below 106 it must bind
++#   retx:  quota starts after warm-up under BLER, HARQ retx keep their size
++BIN="$1"
++QUOTA="$2"
++MODE="${3:-newtx}"
++
++if [ "${MODE}" = "retx" ]; then
++  ARGS=(-u 1 -R 106 -n 400 -L 0 -B 0.3 -Q "${QUOTA}" -q 100)
++else
++  ARGS=(-u 1 -R 106 -n 300 -L 0 -Q "${QUOTA}")
++fi
++OUT=$("${BIN}" "${ARGS[@]}" 2>&1)
++RET=$?
++echo "${OUT}" | tail -n 20
++if [ ${RET} -ne 0 ]; then
++  echo "FAIL: nr_dlbench exited with code ${RET}"
++  exit 1
++fi
++LINE=$(echo "${OUT}" | grep '^smartfarm_quota ')
++if [ -z "${LINE}" ]; then
++  echo "FAIL: no smartfarm_quota summary"
++  exit 1
++fi
++field() { echo "${LINE}" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
++NEW=$(field new_pdsch)
++MAX_NEW=$(field max_new_rb)
++MAX_RETX=$(field max_retx_rb)
++BYPASS=$(field bypass_retx)
++if [ "${NEW}" -eq 0 ]; then
++  echo "FAIL: no new transmission scheduled under the quota"
++  exit 1
++fi
++if [ "${MAX_NEW}" -gt "${QUOTA}" ]; then
++  echo "FAIL: max_new_rb ${MAX_NEW} exceeds quota ${QUOTA}"
++  exit 1
++fi
++if [ "${MODE}" = "retx" ]; then
++  if [ "${MAX_RETX}" -le "${QUOTA}" ] || [ "${BYPASS}" -eq 0 ]; then
++    echo "FAIL: expected a retransmission larger than quota ${QUOTA} (max_retx_rb=${MAX_RETX} bypass=${BYPASS})"
++    exit 1
++  fi
++elif [ "${QUOTA}" -lt 106 ] && [ "${MAX_NEW}" -ne "${QUOTA}" ]; then
++  echo "FAIL: quota ${QUOTA} never became the binding limit (max_new_rb=${MAX_NEW})"
++  exit 1
++fi
++echo "PASS"
+-- 
+2.43.0
+

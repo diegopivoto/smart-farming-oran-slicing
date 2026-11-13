@@ -1,0 +1,45 @@
+version: 1
+hosts:
+  - name: pc1
+    target: local
+    role: 5gc-oai-orchestrator
+    repositories:
+      - path: /home/inatel-crr/5gc-un3gpp/open5gs-core-lab
+      - path: /home/inatel-crr/5gc-un3gpp/openairinterface5g
+    files:
+      - path: /home/inatel-crr/5gc-un3gpp/openairinterface5g/targets/PROJECTS/GENERIC-NR-5GC/CONF/open5gs-gnb.sa.band78.fr1.106PRB.usrpb210.conf
+      - path: /etc/open5gs/amf.yaml
+      - path: /etc/open5gs/smf.yaml
+      - path: /etc/open5gs/upf.yaml
+    commands:
+      - [pgrep, -a, nr-softmodem]
+      - [pgrep, -a, open5gs-amfd]
+
+  - name: pc2
+    target: smartfarm-pc2
+    role: un3gpp-bs-n3iwf
+    repositories:
+      - path: /home/inatel-crr/src/gr-inatelxg
+      - path: /home/inatel-crr/src/inatel5g_range_mac
+      - path: /home/inatel-crr/src/Diego/n3iwf
+    files:
+      - path: /home/inatel-crr/src/gr-inatelxg/scripts/start_bs.sh
+      - path: /home/inatel-crr/src/Diego/n3iwf/run.sh
+    commands:
+      - [ip, -json, address, show, tun0]
+      - [pgrep, -a, n3iwf]
+
+  - name: pc3
+    target: smartfarm-pc3
+    role: un3gpp-ue-n3iwue
+    repositories:
+      - path: /home/inatel-crr/src/gr-inatelxg
+      - path: /home/inatel-crr/src/inatel5g_range_mac
+      - path: /home/inatel-crr/src/Diego/n3iwue
+    files:
+      - path: /home/inatel-crr/src/gr-inatelxg/scripts/startmodem.sh
+      - path: /home/inatel-crr/src/Diego/n3iwue/run.sh
+    commands:
+      - [ip, -json, address, show, tun0]
+      - [ip, -json, vrf, show]
+      - [pgrep, -a, n3iwue]

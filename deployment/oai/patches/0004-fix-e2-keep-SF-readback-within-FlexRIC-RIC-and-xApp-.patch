@@ -1,0 +1,582 @@
+From 86e36223e2a0de82615a9f5e2cd64ac867245f16 Mon Sep 17 00:00:00 2001
+From: Diego Pivoto <>
+Date: Mon, 2 Nov 2026 17:27:02 -0300
+Subject: [PATCH 4/6] fix(e2): keep SF readback within FlexRIC RIC and xApp
+ buffers
+
+The pinned near-RT RIC renders every SLICE indication into a 2048-byte stack
+buffer without bounds (to_string_slice, influx listener), so the 13-label
+readback crashed it with SIGSEGV. Pack the readback by priority (one
+outcome, rules, up to 4 UEs, counters) under a budget computed with the
+RIC's own formulas, and keep the xApp SQLite rows under its 4096-byte
+buffer. Outcomes are now delivered FIFO, one per indication, on every tick
+while any is unreported. A regression test renders the worst case with
+FlexRIC's real to_string_slice() under ASan.
+---
+ openair2/E2AP/RAN_FUNCTION/CMakeLists.txt     |  14 ++
+ .../RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c     | 116 +++++++---------
+ .../CUSTOMIZED/smartfarm_sf_codec.c           |  23 ++++
+ .../CUSTOMIZED/smartfarm_sf_codec.h           |  15 +++
+ .../CUSTOMIZED/smartfarm_sf_readback.c        |  79 +++++++++++
+ .../CUSTOMIZED/smartfarm_sf_readback.h        |  48 +++++++
+ .../CUSTOMIZED/tests/sf_readback_test.c       | 126 ++++++++++++++++++
+ 7 files changed, 351 insertions(+), 70 deletions(-)
+ create mode 100644 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_readback.c
+ create mode 100644 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_readback.h
+ create mode 100644 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/tests/sf_readback_test.c
+
+diff --git a/openair2/E2AP/RAN_FUNCTION/CMakeLists.txt b/openair2/E2AP/RAN_FUNCTION/CMakeLists.txt
+index c4e2f6df58..38be950ec8 100644
+--- a/openair2/E2AP/RAN_FUNCTION/CMakeLists.txt
++++ b/openair2/E2AP/RAN_FUNCTION/CMakeLists.txt
+@@ -77,6 +77,7 @@ add_library(e2_ran_func_du_cucp_cuup STATIC
+             CUSTOMIZED/ran_func_rlc.c
+             CUSTOMIZED/ran_func_sf.c     # Smart Farming E2SM-SF/0.1 over the custom SLICE SM
+             CUSTOMIZED/smartfarm_sf_codec.c
++            CUSTOMIZED/smartfarm_sf_readback.c
+             CUSTOMIZED/ran_func_tc.c     # currently, not implemented; therefore, filling rnd data
+             ../flexric/test/rnd/fill_rnd_data_tc.c
+             )
+@@ -91,6 +92,19 @@ if(ENABLE_TESTS)
+   target_link_libraries(sf_codec_test PRIVATE pthread)
+   add_dependencies(tests sf_codec_test)
+   add_test(NAME sf_codec_test COMMAND sf_codec_test)
++  # regression for the RIC crash: render the readback with FlexRIC's own to_string_slice()
++  add_executable(sf_readback_test CUSTOMIZED/tests/sf_readback_test.c CUSTOMIZED/smartfarm_sf_readback.c
++                 CUSTOMIZED/smartfarm_sf_codec.c
++                 ${CMAKE_SOURCE_DIR}/openair2/LAYER2/NR_MAC_gNB/smartfarm_prb_quota.c
++                 ../flexric/src/ric/iApps/string_parser.c
++                 ../flexric/src/sm/slice_sm/ie/slice_data_ie.c)
++  target_include_directories(sf_readback_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../flexric/src)
++  target_compile_definitions(sf_readback_test PRIVATE ${E2AP_VERSION} ${KPM_VERSION})
++  target_compile_options(sf_readback_test PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
++  target_link_options(sf_readback_test PRIVATE -fsanitize=address,undefined)
++  target_link_libraries(sf_readback_test PRIVATE pthread)
++  add_dependencies(tests sf_readback_test)
++  add_test(NAME sf_readback_test COMMAND sf_readback_test)
+ endif()
+ 
+ # Current implementation:
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c
+index b5bf3b1041..15ed4502ae 100644
+--- a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_sf.c
+@@ -12,6 +12,7 @@
+ 
+ #include "ran_func_sf.h"
+ #include "smartfarm_sf_codec.h"
++#include "smartfarm_sf_readback.h"
+ #include "openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h"
+ #include "openair2/E2AP/flexric/src/util/time_now_us.h"
+ 
+@@ -22,18 +23,16 @@
+ #include <string.h>
+ 
+ #define SF_OUTCOME_RING 8
+-#define SF_MAX_UE_REPORTS 16
+-#define SF_SLICE_SCHED "SF"
+-/* The SLICE SM subscribes at most every 10 ms; report the table at 5 Hz and
+- * right away (next tick) when a new outcome is pending. */
++#define SF_MAX_UE_REPORTS 4
++/* The SLICE SM subscribes at most every 10 ms; report the table at 5 Hz and on
++ * every tick while outcomes are still unreported (one outcome per indication,
++ * oldest first, so the readback stays inside the RIC rendering budget). */
+ #define SF_REPORT_PERIOD_NS 200000000ULL
+ 
+ static pthread_mutex_t outcome_lock = PTHREAD_MUTEX_INITIALIZER;
+ static char outcome_ring[SF_OUTCOME_RING][SF_CODEC_MAX_LABEL];
+-static size_t outcome_next;
+-static size_t outcome_len;
+-static uint64_t outcome_seq; /* guarded by outcome_lock */
+-static uint64_t reported_seq; /* guarded by outcome_lock */
++static uint64_t outcome_seq; /* outcomes stored so far; guarded by outcome_lock */
++static uint64_t outcome_reported; /* highest seq already reported; guarded by outcome_lock */
+ static uint64_t last_report_ns; /* guarded by outcome_lock */
+ 
+ static sf_prb_quota_table_t *quota_table(void)
+@@ -46,21 +45,31 @@ static sf_prb_quota_table_t *quota_table(void)
+ static void remember_outcome(const char *label)
+ {
+   pthread_mutex_lock(&outcome_lock);
+-  snprintf(outcome_ring[outcome_next], SF_CODEC_MAX_LABEL, "%s", label);
+-  outcome_next = (outcome_next + 1) % SF_OUTCOME_RING;
+-  if (outcome_len < SF_OUTCOME_RING)
+-    outcome_len++;
+   outcome_seq++;
++  snprintf(outcome_ring[(outcome_seq - 1) % SF_OUTCOME_RING], SF_CODEC_MAX_LABEL, "%s", label);
+   pthread_mutex_unlock(&outcome_lock);
+ }
+ 
+-static bool report_due(uint64_t now_ns)
++/* Decides whether to report now and picks the outcome to carry: the oldest
++ * unreported one, else the latest (so late subscribers still see it). */
++static bool take_report(uint64_t now_ns, sf_readback_item_t *outcome, bool *has_outcome)
+ {
+   pthread_mutex_lock(&outcome_lock);
+-  const bool due = outcome_seq != reported_seq || now_ns - last_report_ns >= SF_REPORT_PERIOD_NS;
++  const uint64_t oldest = outcome_seq > SF_OUTCOME_RING ? outcome_seq - SF_OUTCOME_RING + 1 : 1;
++  const uint64_t next = outcome_reported + 1 > oldest ? outcome_reported + 1 : oldest;
++  const bool pending = next <= outcome_seq;
++  const bool due = pending || now_ns - last_report_ns >= SF_REPORT_PERIOD_NS;
++  *has_outcome = false;
+   if (due) {
+-    reported_seq = outcome_seq;
+     last_report_ns = now_ns;
++    const uint64_t seq = pending ? next : outcome_seq;
++    if (seq > 0) {
++      snprintf(outcome->label, sizeof(outcome->label), "%s", outcome_ring[(seq - 1) % SF_OUTCOME_RING]);
++      outcome->prb = 0;
++      *has_outcome = true;
++    }
++    if (pending)
++      outcome_reported = next;
+   }
+   pthread_mutex_unlock(&outcome_lock);
+   return due;
+@@ -134,31 +143,6 @@ sm_ag_if_ans_t write_ctrl_sf_sm(void const *data)
+   return ans;
+ }
+ 
+-static bool append_slice(fr_slice_t *slices, uint32_t *n, const char *label, uint16_t prb)
+-{
+-  const size_t len = strlen(label);
+-  fr_slice_t *s = &slices[*n];
+-  memset(s, 0, sizeof(*s));
+-  s->id = *n;
+-  s->label = malloc(len);
+-  s->sched = malloc(sizeof(SF_SLICE_SCHED) - 1);
+-  if (s->label == NULL || s->sched == NULL) {
+-    free(s->label);
+-    free(s->sched);
+-    return false;
+-  }
+-  memcpy(s->label, label, len);
+-  s->len_label = len;
+-  memcpy(s->sched, SF_SLICE_SCHED, sizeof(SF_SLICE_SCHED) - 1);
+-  s->len_sched = sizeof(SF_SLICE_SCHED) - 1;
+-  /* the plain SLICE encoder only accepts concrete parameter types */
+-  s->params.type = SLICE_ALG_SM_V0_STATIC;
+-  s->params.u.sta.pos_low = 0;
+-  s->params.u.sta.pos_high = prb > 0 ? prb - 1U : 0U;
+-  (*n)++;
+-  return true;
+-}
+-
+ static nssai_t first_drb_nssai(const NR_UE_sched_ctrl_t *sched_ctrl)
+ {
+   nssai_t nssai = {0, SF_PRB_QUOTA_NO_SD};
+@@ -175,37 +159,29 @@ bool read_sf_sm(void *data)
+   assert(data != NULL);
+   slice_ind_data_t *ind = (slice_ind_data_t *)data;
+   sf_prb_quota_table_t *table = quota_table();
+-  if (table == NULL || !report_due(sf_realtime_ns()))
++  if (table == NULL)
+     return false;
+ 
+-  const uint32_t capacity = 1 + SF_PRB_QUOTA_MAX_RULES + SF_OUTCOME_RING + SF_MAX_UE_REPORTS;
+-  fr_slice_t *slices = calloc(capacity, sizeof(*slices));
+-  if (slices == NULL)
+-    return false;
+-  uint32_t n = 0;
+-  char label[SF_CODEC_MAX_LABEL];
++  /* priority order: one outcome, live rules, governed UEs, counters */
++  sf_readback_item_t items[1 + SF_PRB_QUOTA_MAX_RULES + SF_MAX_UE_REPORTS + 1];
++  size_t n = 0;
++  bool has_outcome = false;
+   const uint64_t now_ns = sf_realtime_ns();
++  if (!take_report(now_ns, &items[0], &has_outcome))
++    return false;
++  if (has_outcome)
++    n++;
+ 
+   sf_prb_rule_snapshot_t rules[SF_PRB_QUOTA_MAX_RULES];
+   uint32_t version = 0;
+   const int n_rules = sf_prb_quota_snapshot(table, now_ns, rules, &version);
+-  sf_quota_counters_snapshot_t counters = sf_prb_quota_counters(table);
+-  if (sf_codec_format_counters(label, sizeof(label), &counters, version) > 0)
+-    append_slice(slices, &n, label, SF_PRB_QUOTA_DEFAULT);
+   for (int i = 0; i < n_rules; i++)
+-    if (sf_codec_format_rule(label, sizeof(label), &rules[i], version) > 0)
+-      append_slice(slices, &n, label, rules[i].prb_quota);
+-
+-  pthread_mutex_lock(&outcome_lock);
+-  for (size_t i = 0; i < outcome_len; i++) {
+-    size_t idx = (outcome_next + SF_OUTCOME_RING - outcome_len + i) % SF_OUTCOME_RING;
+-    append_slice(slices, &n, outcome_ring[idx], 0);
+-  }
+-  pthread_mutex_unlock(&outcome_lock);
++    if (sf_codec_format_rule(items[n].label, sizeof(items[n].label), &rules[i], version) > 0)
++      items[n++].prb = rules[i].prb_quota;
+ 
+   gNB_MAC_INST *mac = RC.nrmac[0];
+   NR_SCHED_LOCK(&mac->sched_lock);
+-  uint32_t ue_reports = 0;
++  int ue_reports = 0;
+   UE_iterator (mac->UE_info.connected_ue_list, UE) {
+     if (ue_reports >= SF_MAX_UE_REPORTS)
+       break;
+@@ -213,20 +189,20 @@ bool read_sf_sm(void *data)
+     sf_prb_target_t target = {.sst = nssai.sst, .sd = nssai.sd, .rnti = UE->rnti};
+     sf_quota_meta_t meta;
+     uint16_t prb = sf_prb_quota_peek(table, target, now_ns, &meta);
+-    if (sf_codec_format_ue(label, sizeof(label), UE->rnti, nssai.sst, nssai.sd, prb, meta.matched ? meta.action_id : 0) > 0
+-        && append_slice(slices, &n, label, prb))
++    if (sf_codec_format_ue(items[n].label, sizeof(items[n].label), UE->rnti, nssai.sst, nssai.sd, prb,
++                           meta.matched ? meta.action_id : 0)
++        > 0) {
++      items[n++].prb = prb;
+       ue_reports++;
++    }
+   }
+   NR_SCHED_UNLOCK(&mac->sched_lock);
+ 
+-  ind->msg.slice_conf.dl.slices = slices;
+-  ind->msg.slice_conf.dl.len_slices = n;
+-  ind->msg.slice_conf.dl.sched_name = malloc(sizeof(SF_SLICE_SCHED) - 1);
+-  if (ind->msg.slice_conf.dl.sched_name != NULL) {
+-    memcpy(ind->msg.slice_conf.dl.sched_name, SF_SLICE_SCHED, sizeof(SF_SLICE_SCHED) - 1);
+-    ind->msg.slice_conf.dl.len_sched_name = sizeof(SF_SLICE_SCHED) - 1;
+-  }
+-  ind->msg.tstamp = time_now_us();
++  sf_quota_counters_snapshot_t counters = sf_prb_quota_counters(table);
++  if (sf_codec_format_counters(items[n].label, sizeof(items[n].label), &counters, version) > 0)
++    items[n++].prb = SF_PRB_QUOTA_DEFAULT;
++
++  sf_readback_pack(&ind->msg, items, n, time_now_us(), SF_CODEC_RIC_STRING_BUDGET);
+   return true;
+ }
+ 
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.c b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.c
+index 27887dbb80..72bfea2ebd 100644
+--- a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.c
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.c
+@@ -315,6 +315,29 @@ int sf_codec_format_counters(char *buf, size_t cap, const sf_quota_counters_snap
+   return finish(buf, cap, w);
+ }
+ 
++size_t sf_codec_ric_header_len(int64_t tstamp_us, uint32_t n_slices)
++{
++  /* mirrors to_string_slice(): first-slice header plus the trailing "\n" */
++  int n = snprintf(NULL, 0, "slice_stats: tstamp=%" PRId64 ",slice_conf,dl,len_slices=%u\n", tstamp_us, n_slices);
++  return n > 0 ? (size_t)n : 0;
++}
++
++size_t sf_codec_ric_slice_len(uint32_t index, uint32_t id, const char *label, const char *sched, uint32_t pos_high)
++{
++  /* mirrors to_string_slice(): STATIC slice rendering */
++  int n = snprintf(NULL,
++                   0,
++                   ",slice[%u],id=%u,label=%s,type=%d,static,sched=%s,pos_high=%u,pos_low=%u",
++                   index,
++                   id,
++                   label,
++                   1,
++                   sched,
++                   pos_high,
++                   0U);
++  return n > 0 ? (size_t)n : 0;
++}
++
+ int sf_codec_format_ue(char *buf, size_t cap, uint16_t rnti, uint8_t sst, uint32_t sd, uint16_t prb_quota, uint64_t action_id)
+ {
+   int w = snprintf(buf,
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.h b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.h
+index dbed298223..824a329c4c 100644
+--- a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.h
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_codec.h
+@@ -46,6 +46,21 @@ bool sf_codec_parse_request(const char *text, size_t len, sf_request_t *out);
+ int sf_codec_format_outcome(char *buf, size_t cap, const sf_quota_outcome_t *outcome, uint64_t at_ns);
+ int sf_codec_format_rule(char *buf, size_t cap, const sf_prb_rule_snapshot_t *rule, uint32_t version);
+ int sf_codec_format_counters(char *buf, size_t cap, const sf_quota_counters_snapshot_t *counters, uint32_t version);
++/*
++ * FlexRIC's near-RT RIC (pinned d7a71285) stringifies every SLICE indication
++ * into a 2048-byte stack buffer without bounds (iApps/string_parser.c,
++ * to_string_slice, used by the influx listener for every SM). An indication
++ * whose rendering exceeds it crashes the RIC, so the gNB sizes each readback
++ * with the same formulas and keeps it under SF_CODEC_RIC_STRING_BUDGET.
++ */
++#define SF_CODEC_RIC_STRING_BUDGET 1700U
++
++/* Length of the RIC rendering header and trailer for an indication with n DL slices. */
++size_t sf_codec_ric_header_len(int64_t tstamp_us, uint32_t n_slices);
++
++/* Length of the RIC rendering of one STATIC DL slice. */
++size_t sf_codec_ric_slice_len(uint32_t index, uint32_t id, const char *label, const char *sched, uint32_t pos_high);
++
+ int sf_codec_format_ue(char *buf,
+                        size_t cap,
+                        uint16_t rnti,
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_readback.c b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_readback.c
+new file mode 100644
+index 0000000000..83deaa759b
+--- /dev/null
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_readback.c
+@@ -0,0 +1,79 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/*! \file smartfarm_sf_readback.c
++ * \brief SLICE indication packing under the FlexRIC RIC rendering budget.
++ */
++
++#include "smartfarm_sf_readback.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++static uint32_t pos_high_of(uint16_t prb)
++{
++  return prb > 0 ? prb - 1U : 0U;
++}
++
++static char *dup_bytes(const char *src, size_t len)
++{
++  char *dst = malloc(len);
++  if (dst != NULL)
++    memcpy(dst, src, len);
++  return dst;
++}
++
++uint32_t sf_readback_pack(slice_ind_msg_t *msg,
++                          const sf_readback_item_t *items,
++                          size_t n_items,
++                          int64_t tstamp_us,
++                          size_t budget)
++{
++  /* choose first, allocate after: the header length depends on the final count */
++  size_t chosen[SF_READBACK_MAX_SLICES];
++  uint32_t n = 0;
++  size_t body = 0;
++  size_t sql = 0; /* estimated SQL bytes of the rows already chosen */
++  for (size_t i = 0; i < n_items && n < SF_READBACK_MAX_SLICES; i++) {
++    const size_t len = sf_codec_ric_slice_len(n, n, items[i].label, SF_READBACK_SCHED, pos_high_of(items[i].prb));
++    if (sf_codec_ric_header_len(tstamp_us, n + 1) + body + len > budget || sql > SF_READBACK_SQL_BUDGET)
++      continue;
++    chosen[n++] = i;
++    body += len;
++    sql += strlen(items[i].label) + SF_READBACK_SQL_ROW_OVERHEAD;
++  }
++
++  ul_dl_slice_conf_t *dl = &msg->slice_conf.dl;
++  dl->sched_name = dup_bytes(SF_READBACK_SCHED, sizeof(SF_READBACK_SCHED) - 1);
++  dl->len_sched_name = dl->sched_name != NULL ? sizeof(SF_READBACK_SCHED) - 1 : 0;
++  dl->slices = n > 0 ? calloc(n, sizeof(*dl->slices)) : NULL;
++  if (n > 0 && dl->slices == NULL)
++    return 0;
++
++  uint32_t written = 0;
++  for (uint32_t k = 0; k < n; k++) {
++    const sf_readback_item_t *item = &items[chosen[k]];
++    fr_slice_t *s = &dl->slices[written];
++    const size_t len = strlen(item->label);
++    s->label = dup_bytes(item->label, len);
++    s->sched = dup_bytes(SF_READBACK_SCHED, sizeof(SF_READBACK_SCHED) - 1);
++    if (s->label == NULL || s->sched == NULL) {
++      free(s->label);
++      free(s->sched);
++      memset(s, 0, sizeof(*s));
++      continue;
++    }
++    s->id = written;
++    s->len_label = len;
++    s->len_sched = sizeof(SF_READBACK_SCHED) - 1;
++    /* the plain SLICE encoder only accepts concrete parameter types */
++    s->params.type = SLICE_ALG_SM_V0_STATIC;
++    s->params.u.sta.pos_low = 0;
++    s->params.u.sta.pos_high = pos_high_of(item->prb);
++    written++;
++  }
++  dl->len_slices = written;
++  msg->tstamp = tstamp_us;
++  return written;
++}
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_readback.h b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_readback.h
+new file mode 100644
+index 0000000000..f0ec1236a2
+--- /dev/null
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/smartfarm_sf_readback.h
+@@ -0,0 +1,48 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/*! \file smartfarm_sf_readback.h
++ * \brief Packs E2SM-SF readback labels into a SLICE indication within the RIC rendering budget.
++ */
++
++#ifndef SMARTFARM_SF_READBACK_H
++#define SMARTFARM_SF_READBACK_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "smartfarm_sf_codec.h"
++#include "openair2/E2AP/flexric/src/sm/slice_sm/ie/slice_data_ie.h"
++
++#define SF_READBACK_SCHED "SF"
++/*
++ * The FlexRIC xApp SDK stores each SLICE indication in SQLite through a
++ * 4096-byte buffer and asserts >= 1024 free bytes before every slice row
++ * (xApp/db/sqlite3/sqlite3_wrapper.c). Each row is conservatively estimated
++ * as label length + SF_READBACK_SQL_ROW_OVERHEAD, and the rows written before
++ * the last one must stay within SF_READBACK_SQL_BUDGET.
++ */
++#define SF_READBACK_MAX_SLICES 10U
++#define SF_READBACK_SQL_ROW_OVERHEAD 200U
++#define SF_READBACK_SQL_BUDGET 3000U
++
++typedef struct {
++  char label[SF_CODEC_MAX_LABEL];
++  uint16_t prb; /* rendered as STATIC pos_high = prb - 1 (0 when prb is 0) */
++} sf_readback_item_t;
++
++/*
++ * Fills msg->slice_conf.dl with the longest prefix-compatible selection of
++ * `items` (given in priority order; an item that does not fit is skipped and
++ * later, smaller items may still be taken) whose FlexRIC rendering stays
++ * within `budget` bytes. Returns the number of slices written; the caller
++ * owns msg and frees it with free_slice_ind_msg().
++ */
++uint32_t sf_readback_pack(slice_ind_msg_t *msg,
++                          const sf_readback_item_t *items,
++                          size_t n_items,
++                          int64_t tstamp_us,
++                          size_t budget);
++
++#endif
+diff --git a/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/tests/sf_readback_test.c b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/tests/sf_readback_test.c
+new file mode 100644
+index 0000000000..8033939bc7
+--- /dev/null
++++ b/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/tests/sf_readback_test.c
+@@ -0,0 +1,126 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/* Regression for the near-RT RIC crash of 2026-11-02: the readback must always
++ * render within FlexRIC's 2048-byte to_string_slice() buffer. The real
++ * FlexRIC renderer is linked in, so ASan flags any overflow. */
++
++#include "../smartfarm_sf_readback.h"
++#include "openair2/E2AP/flexric/src/ric/iApps/string_parser.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(cond)                                                    \
++  do {                                                                 \
++    if (!(cond)) {                                                     \
++      fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
++      exit(1);                                                         \
++    }                                                                  \
++  } while (0)
++
++static const int64_t TSTAMP = 1793646912123456LL;
++
++/* worst-case widths: every numeric field at its maximum */
++static size_t worst_case_items(sf_readback_item_t *items)
++{
++  size_t n = 0;
++  sf_quota_outcome_t o = {.status = SF_QUOTA_ROLLBACK_SUPERSEDED, .duplicate = true, .action_id = UINT64_MAX,
++                          .target = {.sst = 255, .sd = 0xffffff, .rnti = 65535}, .requested_prb = 65535,
++                          .applied_prb = 106, .previous_prb = 106, .rollback_token = UINT64_MAX,
++                          .expires_at_ns = UINT64_MAX, .table_version = UINT32_MAX};
++  for (int i = 0; i < 8; i++, n++) {
++    sf_codec_format_outcome(items[n].label, sizeof(items[n].label), &o, UINT64_MAX);
++    items[n].prb = 0;
++  }
++  for (int i = 0; i < SF_PRB_QUOTA_MAX_RULES; i++, n++) {
++    sf_prb_rule_snapshot_t r = {.target = {.sst = 255, .sd = 0xffffff, .rnti = 65535}, .prb_quota = 106,
++                                .expires_at_ns = UINT64_MAX, .action_id = UINT64_MAX};
++    sf_codec_format_rule(items[n].label, sizeof(items[n].label), &r, UINT32_MAX);
++    items[n].prb = 106;
++  }
++  for (int i = 0; i < 16; i++, n++) {
++    sf_codec_format_ue(items[n].label, sizeof(items[n].label), 65535, 255, 0xffffff, 106, UINT64_MAX);
++    items[n].prb = 106;
++  }
++  sf_quota_counters_snapshot_t c = {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
++  sf_codec_format_counters(items[n].label, sizeof(items[n].label), &c, UINT32_MAX);
++  items[n].prb = 106;
++  return n + 1;
++}
++
++static size_t render_len_unbounded(const sf_readback_item_t *items, size_t n)
++{
++  size_t total = sf_codec_ric_header_len(TSTAMP, (uint32_t)n);
++  for (size_t i = 0; i < n; i++)
++    total += sf_codec_ric_slice_len((uint32_t)i, (uint32_t)i, items[i].label, "SF", items[i].prb ? items[i].prb - 1U : 0U);
++  return total;
++}
++
++static void test_worst_case_fits_real_ric_renderer(void)
++{
++  sf_readback_item_t items[40];
++  const size_t n_items = worst_case_items(items);
++  /* the unbounded composition is what crashed the RIC */
++  CHECK(render_len_unbounded(items, n_items) > 2048);
++
++  slice_ind_msg_t msg = {0};
++  const uint32_t n = sf_readback_pack(&msg, items, n_items, TSTAMP, SF_CODEC_RIC_STRING_BUDGET);
++  CHECK(n >= 2);
++  CHECK(strncmp(msg.slice_conf.dl.slices[0].label, "sf=0.1;kind=outcome", 19) == 0);
++
++  /* decoded labels are NUL terminated by the RIC; mimic that before rendering */
++  for (uint32_t i = 0; i < n; i++) {
++    fr_slice_t *s = &msg.slice_conf.dl.slices[i];
++    s->label = realloc(s->label, s->len_label + 1);
++    s->label[s->len_label] = '\0';
++    s->sched = realloc(s->sched, s->len_sched + 1);
++    s->sched[s->len_sched] = '\0';
++  }
++  char out[2048] = {0};
++  to_string_slice(&msg, msg.tstamp, out, sizeof(out));
++  /* our size model must equal the real rendering, byte for byte */
++  size_t expected = sf_codec_ric_header_len(TSTAMP, n);
++  for (uint32_t i = 0; i < n; i++)
++    expected += sf_codec_ric_slice_len(i, i, msg.slice_conf.dl.slices[i].label, "SF", msg.slice_conf.dl.slices[i].params.u.sta.pos_high);
++  CHECK(strlen(out) == expected);
++  CHECK(strlen(out) <= SF_CODEC_RIC_STRING_BUDGET);
++  /* xApp SQLite constraint: rows before the last one fit the SQL budget */
++  CHECK(n <= SF_READBACK_MAX_SLICES);
++  size_t sql = 0;
++  for (uint32_t i = 0; i + 1 < n; i++)
++    sql += msg.slice_conf.dl.slices[i].len_label + SF_READBACK_SQL_ROW_OVERHEAD;
++  CHECK(sql <= SF_READBACK_SQL_BUDGET + 1024);
++  free_slice_ind_msg(&msg);
++}
++
++static void test_typical_lab_readback_is_complete(void)
++{
++  sf_readback_item_t items[5];
++  sf_quota_outcome_t o = {.status = SF_QUOTA_APPLIED, .action_id = 1793652000000000000ULL,
++                          .target = {.sst = 1, .sd = 1}, .requested_prb = 52, .applied_prb = 52, .previous_prb = 106,
++                          .rollback_token = 0x1234, .expires_at_ns = 1793652030000000000ULL, .table_version = 12};
++  sf_codec_format_outcome(items[0].label, sizeof(items[0].label), &o, 1793652000001000000ULL);
++  sf_prb_rule_snapshot_t r = {.target = {.sst = 1, .sd = 1}, .prb_quota = 52,
++                              .expires_at_ns = 1793652030000000000ULL, .action_id = 1793652000000000000ULL};
++  sf_codec_format_rule(items[1].label, sizeof(items[1].label), &r, 12);
++  sf_codec_format_ue(items[2].label, sizeof(items[2].label), 0x5f7f, 1, 1, 52, 1793652000000000000ULL);
++  sf_codec_format_ue(items[3].label, sizeof(items[3].label), 0x4601, 0, 0xffffff, 106, 0);
++  sf_quota_counters_snapshot_t c = {123456789, 0, 0, 0, 1234567, 12};
++  sf_codec_format_counters(items[4].label, sizeof(items[4].label), &c, 12);
++  for (int i = 0; i < 5; i++)
++    items[i].prb = 52;
++  slice_ind_msg_t msg = {0};
++  CHECK(sf_readback_pack(&msg, items, 5, TSTAMP, SF_CODEC_RIC_STRING_BUDGET) == 5);
++  free_slice_ind_msg(&msg);
++}
++
++int main(void)
++{
++  test_worst_case_fits_real_ric_renderer();
++  test_typical_lab_readback_is_complete();
++  printf("sf_readback_test: all tests passed\n");
++  return 0;
++}
+-- 
+2.43.0
+

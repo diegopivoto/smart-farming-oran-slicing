@@ -1,0 +1,452 @@
+From 5dd54bbd286de2f501930689676896d427397d71 Mon Sep 17 00:00:00 2001
+From: Diego Pivoto <>
+Date: Fri, 6 Nov 2026 10:12:17 -0300
+Subject: [PATCH 5/6] fix(e2-kpm): report DRB measurements of the subscribed
+ slice, per (UE, DRB)
+
+The UE-level DRB measurements (DRB.UEThpDl/Ul, DRB.RlcSduDelayDl,
+DRB.PdcpSduVolumeDL/UL) always read DRB 1, and the previous-report counters
+were indexed by the subscription's UE index. With one S-NSSAI subscription
+per slice and a phone holding a default PDU session plus a service session,
+the service subscription read the idle DRB of the other session and the
+subscriptions consumed each other's deltas (throughput and RLC delay 0).
+
+The S-NSSAI matcher now keeps every DRB of the UE in the subscribed slice;
+throughput and volume add their deltas, RLC delay takes the worst DRB, and
+the counters (and the PRB-usage baselines) are kept per (UE, DRB). A DRB
+without RLC/PDCP entity is skipped instead of asserting.
+---
+ .../E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm.c    |  52 +++--
+ .../RAN_FUNCTION/O-RAN/ran_func_kpm_subs.c    | 213 ++++++++++++------
+ .../RAN_FUNCTION/O-RAN/ran_func_kpm_subs.h    |   5 +
+ 3 files changed, 187 insertions(+), 83 deletions(-)
+
+diff --git a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm.c b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm.c
+index 7a96cb1f4a..ab1be23622 100644
+--- a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm.c
++++ b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm.c
+@@ -39,6 +39,9 @@ typedef struct {
+   // Optional
+   // only used to retrieve MAC/RLC stats
+   NR_UE_info_t* ue_info_list[MAX_MOBILES_PER_GNB];
++  // DRBs whose S-NSSAI matched the test condition (none: DRB 1 is used)
++  int rb_id[MAX_MOBILES_PER_GNB][KPM_MAX_DRB_PER_UE];
++  int n_rb[MAX_MOBILES_PER_GNB];
+ }arr_ue_id_t;
+ 
+ static void free_arr_ue_id(arr_ue_id_t arr_ue_id)
+@@ -124,6 +127,14 @@ static cudu_ue_info_pair_t fill_ue_related_info(arr_ue_id_t* arr_ue_id, const si
+     ue_info.ue = arr_ue_id->ue_info_list[ue_idx];
+   }
+   
++  ue_info.n_rb = arr_ue_id->n_rb[ue_idx];
++  for (int k = 0; k < ue_info.n_rb; k++)
++    ue_info.rb_id[k] = arr_ue_id->rb_id[ue_idx][k];
++  if (ue_info.n_rb == 0) {
++    ue_info.rb_id[0] = 1;
++    ue_info.n_rb = 1;
++  }
++
+   return ue_info;
+ }
+ 
+@@ -282,28 +293,33 @@ static arr_ue_id_t filter_ues_by_s_nssai_in_du_or_monolithic(const test_info_lst
+   // Take MAC info
+   UE_iterator(mac->UE_info.connected_ue_list, ue) {
+     NR_UE_sched_ctrl_t *sched_ctrl = &ue->UE_sched_ctrl;
+-    // UE matches if any of its DRBs matches
++    // UE matches if any of its DRBs matches; keep every matching DRB (DRB n uses LCID n + 3)
++    int n_rb = 0;
++    int rb_id[KPM_MAX_DRB_PER_UE];
+     for (size_t l = 0; l < seq_arr_size(&sched_ctrl->lc_config); ++l) {
+       const nr_lc_config_t *c = seq_arr_at(&sched_ctrl->lc_config, l);
+-      if (nssai_matches(c->nssai, sst, sd)) {
+-        if (node_type == ngran_gNB_DU) {
+-          f1_ue_data_t rrc_ue_id = du_get_f1_ue_data(ue->rnti); // gNB CU UE ID = rrc_ue_id
+-          arr_ue_id.ue_id[arr_ue_id.sz] = fill_ue_id_data[ngran_gNB_DU](NULL, rrc_ue_id.secondary_ue, 0);
+-        } else {
+-          rrc_gNB_ue_context_t* rrc_ue_context = rrc_gNB_get_ue_context_by_rnti(RC.nrrrc[0], -1, ue->rnti);
+-          /* UE has no AMF UE NGAP ID yet => can't send message */
+-          if (rrc_ue_context->ue_context.amf_ue_ngap_id >= (1LL << 40))
+-            continue;
+-          arr_ue_id.ue_id[arr_ue_id.sz] = fill_ue_id_data[ngran_gNB](&rrc_ue_context->ue_context, 0, 0);
+-        }
++      if (c->lcid > 3 && nssai_matches(c->nssai, sst, sd) && n_rb < KPM_MAX_DRB_PER_UE)
++        rb_id[n_rb++] = c->lcid - 3;
++    }
++    if (n_rb == 0)
++      continue;
++    if (node_type == ngran_gNB_DU) {
++      f1_ue_data_t rrc_ue_id = du_get_f1_ue_data(ue->rnti); // gNB CU UE ID = rrc_ue_id
++      arr_ue_id.ue_id[arr_ue_id.sz] = fill_ue_id_data[ngran_gNB_DU](NULL, rrc_ue_id.secondary_ue, 0);
++    } else {
++      rrc_gNB_ue_context_t* rrc_ue_context = rrc_gNB_get_ue_context_by_rnti(RC.nrrrc[0], -1, ue->rnti);
++      /* UE has no AMF UE NGAP ID yet => can't send message */
++      if (rrc_ue_context->ue_context.amf_ue_ngap_id >= (1LL << 40))
++        continue;
++      arr_ue_id.ue_id[arr_ue_id.sz] = fill_ue_id_data[ngran_gNB](&rrc_ue_context->ue_context, 0, 0);
++    }
+ 
+-        // store NR_UE_info_t
+-        arr_ue_id.ue_info_list[arr_ue_id.sz] = ue;
++    // store NR_UE_info_t and the DRBs of the matching slice
++    arr_ue_id.ue_info_list[arr_ue_id.sz] = ue;
++    arr_ue_id.n_rb[arr_ue_id.sz] = n_rb;
++    memcpy(arr_ue_id.rb_id[arr_ue_id.sz], rb_id, sizeof(rb_id));
+ 
+-        arr_ue_id.sz++;
+-        break;
+-      }
+-    }
++    arr_ue_id.sz++;
+     AssertFatal(arr_ue_id.sz < MAX_MOBILES_PER_GNB, "cannot have more UEs than global UE number maximum\n");
+   }
+ 
+diff --git a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm_subs.c b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm_subs.c
+index 9c029d18bd..30bf68154a 100644
+--- a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm_subs.c
++++ b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm_subs.c
+@@ -30,18 +30,48 @@ typedef struct uldlcounter {
+   uint32_t ul;
+ } uldlcounter_t;
+ 
+-static uldlcounter_t last_pdcp_sdu_total_bytes[MAX_MOBILES_PER_GNB] = {0};
++/* Values of the previous report, kept per (UE, DRB) instead of per UE index of a subscription: with one S-NSSAI
++   subscription per slice, a UE with PDU sessions in two slices is reported by two subscriptions (one DRB each), and
++   counters indexed by the subscription's UE index would mix their deltas. A new entry starts at the current value, so
++   its first report is 0 instead of the whole history of the DRB. */
++typedef struct {
++  bool used;
++  uint32_t rrc_ue_id;
++  int rb_id;
++  bool pdcp_set, rlc_set, prb_set;
++  uldlcounter_t pdcp_sdu_bytes;
++  uldlcounter_t rlc_pdu_bytes;
++  uldlcounter_t total_prbs;
++  uint64_t prb_aggregate_dl;
++  uint64_t prb_aggregate_ul;
++} drb_counters_t;
++
++static drb_counters_t drb_counters[MAX_MOBILES_PER_GNB * 4];
++
++static drb_counters_t *get_drb_counters(const uint32_t rrc_ue_id, const int rb_id)
++{
++  drb_counters_t *free_slot = NULL;
++  for (size_t i = 0; i < sizeof(drb_counters) / sizeof(drb_counters[0]); i++) {
++    drb_counters_t *c = &drb_counters[i];
++    if (c->used && c->rrc_ue_id == rrc_ue_id && c->rb_id == rb_id)
++      return c;
++    if (!c->used && free_slot == NULL)
++      free_slot = c;
++  }
++  if (free_slot == NULL)  // table full (UEs that left): start over
++    free_slot = memset(drb_counters, 0, sizeof(drb_counters));
++  *free_slot = (drb_counters_t){.used = true, .rrc_ue_id = rrc_ue_id, .rb_id = rb_id};
++  return free_slot;
++}
+ 
+-static nr_pdcp_statistics_t get_pdcp_stats_per_drb(const uint32_t rrc_ue_id, const int rb_id)
++// false when the DRB has no PDCP entity (e.g. its PDU session is being released): the DRB is skipped
++static bool get_pdcp_stats_per_drb(const uint32_t rrc_ue_id, const int rb_id, nr_pdcp_statistics_t *pdcp)
+ {
+-  nr_pdcp_statistics_t pdcp = {0};
+   const int srb_flag = 0;
+ 
+   // Get PDCP stats for specific DRB
+-  const bool rc = nr_pdcp_get_statistics(rrc_ue_id, srb_flag, rb_id, &pdcp);
+-  assert(rc == true && "Cannot get PDCP stats\n");
+-
+-  return pdcp;
++  *pdcp = (nr_pdcp_statistics_t){0};
++  return nr_pdcp_get_statistics(rrc_ue_id, srb_flag, rb_id, pdcp);
+ }
+ 
+ /* 3GPP TS 28.522 - section 5.1.2.1.1.1
+@@ -49,20 +79,28 @@ static nr_pdcp_statistics_t get_pdcp_stats_per_drb(const uint32_t rrc_ue_id, con
+ static meas_record_lst_t fill_DRB_PdcpSduVolumeDL(__attribute__((unused)) const label_info_lst_t label,
+                                                   __attribute__((unused)) uint32_t gran_period_ms,
+                                                   cudu_ue_info_pair_t ue_info,
+-                                                  const size_t ue_idx,
++                                                  __attribute__((unused)) const size_t ue_idx,
+                                                   __attribute__((unused))e2_node_level_stats_t* node_stats)
+ {
+   meas_record_lst_t meas_record = {0};
+ 
+-  // Get PDCP stats per DRB
+-  const int rb_id = 1;  // at the moment, only 1 DRB is supported
+-  nr_pdcp_statistics_t pdcp = get_pdcp_stats_per_drb(ue_info.rrc_ue_id, rb_id);
++  // DL data volume delivered to PDCP in the DRBs of the subscribed slice
++  uint64_t bits = 0;
++  for (int k = 0; k < ue_info.n_rb; k++) {
++    nr_pdcp_statistics_t pdcp;
++    if (!get_pdcp_stats_per_drb(ue_info.rrc_ue_id, ue_info.rb_id[k], &pdcp))
++      continue;
++    drb_counters_t *last = get_drb_counters(ue_info.rrc_ue_id, ue_info.rb_id[k]);
++    if (!last->pdcp_set) {
++      last->pdcp_sdu_bytes = (uldlcounter_t){.dl = pdcp.rxsdu_bytes, .ul = pdcp.txsdu_bytes};
++      last->pdcp_set = true;
++    }
++    bits += (uint64_t)(uint32_t)(pdcp.rxsdu_bytes - last->pdcp_sdu_bytes.dl) * 8;
++    last->pdcp_sdu_bytes.dl = pdcp.rxsdu_bytes;
++  }
+ 
+   meas_record.value = INTEGER_MEAS_VALUE;
+-
+-  // Get DL data volume delivered to PDCP layer
+-  meas_record.int_val = (pdcp.rxsdu_bytes - last_pdcp_sdu_total_bytes[ue_idx].dl)*8/1000000;   // [Mb]
+-  last_pdcp_sdu_total_bytes[ue_idx].dl = pdcp.rxsdu_bytes;
++  meas_record.int_val = bits / 1000000;   // [Mb]
+ 
+   return meas_record;
+ }
+@@ -72,20 +110,28 @@ static meas_record_lst_t fill_DRB_PdcpSduVolumeDL(__attribute__((unused)) const
+ static meas_record_lst_t fill_DRB_PdcpSduVolumeUL(__attribute__((unused)) const label_info_lst_t label,
+                                                   __attribute__((unused)) uint32_t gran_period_ms,
+                                                   cudu_ue_info_pair_t ue_info,
+-                                                  const size_t ue_idx,
++                                                  __attribute__((unused)) const size_t ue_idx,
+                                                   __attribute__((unused))e2_node_level_stats_t* node_stats)
+ {
+   meas_record_lst_t meas_record = {0};
+ 
+-  // Get PDCP stats per DRB
+-  const int rb_id = 1;  // at the moment, only 1 DRB is supported
+-  nr_pdcp_statistics_t pdcp = get_pdcp_stats_per_drb(ue_info.rrc_ue_id, rb_id);
++  // UL data volume delivered from PDCP in the DRBs of the subscribed slice
++  uint64_t bits = 0;
++  for (int k = 0; k < ue_info.n_rb; k++) {
++    nr_pdcp_statistics_t pdcp;
++    if (!get_pdcp_stats_per_drb(ue_info.rrc_ue_id, ue_info.rb_id[k], &pdcp))
++      continue;
++    drb_counters_t *last = get_drb_counters(ue_info.rrc_ue_id, ue_info.rb_id[k]);
++    if (!last->pdcp_set) {
++      last->pdcp_sdu_bytes = (uldlcounter_t){.dl = pdcp.rxsdu_bytes, .ul = pdcp.txsdu_bytes};
++      last->pdcp_set = true;
++    }
++    bits += (uint64_t)(uint32_t)(pdcp.txsdu_bytes - last->pdcp_sdu_bytes.ul) * 8;
++    last->pdcp_sdu_bytes.ul = pdcp.txsdu_bytes;
++  }
+ 
+   meas_record.value = INTEGER_MEAS_VALUE;
+-
+-  // Get UL data volume delivered from PDCP layer
+-  meas_record.int_val = (pdcp.txsdu_bytes - last_pdcp_sdu_total_bytes[ue_idx].ul)*8/1000000;   // [Mb]
+-  last_pdcp_sdu_total_bytes[ue_idx].ul = pdcp.txsdu_bytes;
++  meas_record.int_val = bits / 1000000;   // [Mb]
+ 
+   return meas_record;
+ }
+@@ -193,22 +239,21 @@ static meas_record_lst_t fill_RRC_ConnMean(__attribute__((unused)) const label_i
+ }
+ 
+ #if defined (NGRAN_GNB_DU)
+-static uldlcounter_t last_rlc_pdu_total_bytes[MAX_MOBILES_PER_GNB] = {0};
+-static uldlcounter_t last_total_prbs[MAX_MOBILES_PER_GNB] = {0};
+ 
+-static nr_rlc_statistics_t get_rlc_stats_per_drb(const rnti_t rnti, const int rb_id)
++// false when the DRB has no RLC entity (e.g. its PDU session is being released): the DRB is skipped
++static bool get_rlc_stats_per_drb(const rnti_t rnti, const int rb_id, nr_rlc_statistics_t *rlc)
+ {
+-  nr_rlc_statistics_t rlc = {0};
+   const int srb_flag = 0;
+ 
+   // Get RLC stats for specific DRB
+-  const bool rc = nr_rlc_get_statistics(rnti, srb_flag, rb_id, &rlc);
+-  assert(rc == true && "Cannot get RLC stats\n");
++  *rlc = (nr_rlc_statistics_t){0};
++  if (!nr_rlc_get_statistics(rnti, srb_flag, rb_id, rlc))
++    return false;
+ 
+   // Activate average sojourn time at the RLC buffer for specific DRB
+   nr_rlc_activate_avg_time_to_tx(rnti, rb_id+3, 1);
+-  
+-  return rlc;  
++
++  return true;
+ }
+ 
+ /* 3GPP TS 28.522 - section 5.1.3.3.3
+@@ -220,15 +265,19 @@ static meas_record_lst_t fill_DRB_RlcSduDelayDl(__attribute__((unused)) const la
+                                                 __attribute__((unused))e2_node_level_stats_t* node_stats)
+ {
+   meas_record_lst_t meas_record = {0};
+-  
+-  // Get RLC stats per DRB
+-  const int rb_id = 1;  // at the moment, only 1 DRB is supported
+-  nr_rlc_statistics_t rlc = get_rlc_stats_per_drb(ue_info.ue->rnti, rb_id);
+ 
+-  meas_record.value = REAL_MEAS_VALUE;
++  // Sojourn time at the RLC buffer: the worst DRB of the subscribed slice
++  double delay_us = 0;
++  for (int k = 0; k < ue_info.n_rb; k++) {
++    nr_rlc_statistics_t rlc;
++    if (!get_rlc_stats_per_drb(ue_info.ue->rnti, ue_info.rb_id[k], &rlc))
++      continue;
++    if (rlc.txsdu_avg_time_to_tx > delay_us)
++      delay_us = rlc.txsdu_avg_time_to_tx;
++  }
+ 
+-  // Get the value of sojourn time at the RLC buffer
+-  meas_record.real_val = rlc.txsdu_avg_time_to_tx;  // [μs]
++  meas_record.value = REAL_MEAS_VALUE;
++  meas_record.real_val = delay_us;  // [μs]
+ 
+   return meas_record;
+ }
+@@ -239,18 +288,28 @@ static meas_record_lst_t fill_DRB_RlcSduDelayDl(__attribute__((unused)) const la
+ static meas_record_lst_t fill_DRB_UEThpDl(__attribute__((unused)) const label_info_lst_t label,
+                                           uint32_t gran_period_ms,
+                                           cudu_ue_info_pair_t ue_info,
+-                                          const size_t ue_idx,
++                                          __attribute__((unused)) const size_t ue_idx,
+                                           __attribute__((unused))e2_node_level_stats_t* node_stats)
+ {
+   meas_record_lst_t meas_record = {0};
+-  
+-  const int rb_id = 1;  // at the moment, only 1 DRB is supported
+-  nr_rlc_statistics_t rlc = get_rlc_stats_per_drb(ue_info.ue->rnti, rb_id);
+-  meas_record.value = REAL_MEAS_VALUE;
+ 
+-  // Calculate DL Thp
+-  meas_record.real_val = (double)(rlc.txpdu_bytes - last_rlc_pdu_total_bytes[ue_idx].dl)*8/gran_period_ms;  // [kbps]
+-  last_rlc_pdu_total_bytes[ue_idx].dl = rlc.txpdu_bytes;
++  // DL throughput of the DRBs of the subscribed slice
++  uint64_t bytes = 0;
++  for (int k = 0; k < ue_info.n_rb; k++) {
++    nr_rlc_statistics_t rlc;
++    if (!get_rlc_stats_per_drb(ue_info.ue->rnti, ue_info.rb_id[k], &rlc))
++      continue;
++    drb_counters_t *last = get_drb_counters(ue_info.rrc_ue_id, ue_info.rb_id[k]);
++    if (!last->rlc_set) {
++      last->rlc_pdu_bytes = (uldlcounter_t){.dl = rlc.txpdu_bytes, .ul = rlc.rxpdu_bytes};
++      last->rlc_set = true;
++    }
++    bytes += (uint32_t)(rlc.txpdu_bytes - last->rlc_pdu_bytes.dl);
++    last->rlc_pdu_bytes.dl = rlc.txpdu_bytes;
++  }
++
++  meas_record.value = REAL_MEAS_VALUE;
++  meas_record.real_val = (double)bytes*8/gran_period_ms;  // [kbps]
+ 
+   return meas_record;
+ }
+@@ -261,21 +320,29 @@ static meas_record_lst_t fill_DRB_UEThpDl(__attribute__((unused)) const label_in
+ static meas_record_lst_t fill_DRB_UEThpUl(__attribute__((unused)) const label_info_lst_t label,
+                                           uint32_t gran_period_ms,
+                                           cudu_ue_info_pair_t ue_info,
+-                                          const size_t ue_idx,
++                                          __attribute__((unused)) const size_t ue_idx,
+                                           __attribute__((unused))e2_node_level_stats_t* node_stats)
+ {
+   meas_record_lst_t meas_record = {0};
+-  
+-  // Get RLC stats per DRB
+-  const int rb_id = 1;  // at the moment, only 1 DRB is supported
+-  nr_rlc_statistics_t rlc = get_rlc_stats_per_drb(ue_info.ue->rnti, rb_id);
++
++  // UL throughput of the DRBs of the subscribed slice
++  uint64_t bytes = 0;
++  for (int k = 0; k < ue_info.n_rb; k++) {
++    nr_rlc_statistics_t rlc;
++    if (!get_rlc_stats_per_drb(ue_info.ue->rnti, ue_info.rb_id[k], &rlc))
++      continue;
++    drb_counters_t *last = get_drb_counters(ue_info.rrc_ue_id, ue_info.rb_id[k]);
++    if (!last->rlc_set) {
++      last->rlc_pdu_bytes = (uldlcounter_t){.dl = rlc.txpdu_bytes, .ul = rlc.rxpdu_bytes};
++      last->rlc_set = true;
++    }
++    bytes += (uint32_t)(rlc.rxpdu_bytes - last->rlc_pdu_bytes.ul);
++    last->rlc_pdu_bytes.ul = rlc.rxpdu_bytes;
++  }
+ 
+   meas_record.value = REAL_MEAS_VALUE;
++  meas_record.real_val = (double)bytes*8/gran_period_ms;  // [kbps]
+ 
+-  // Calculate UL Thp
+-  meas_record.real_val = (double)(rlc.rxpdu_bytes - last_rlc_pdu_total_bytes[ue_idx].ul)*8/gran_period_ms;  // [kbps]
+-  last_rlc_pdu_total_bytes[ue_idx].ul = rlc.rxpdu_bytes;
+-  
+   return meas_record;
+ }
+ 
+@@ -284,17 +351,25 @@ static meas_record_lst_t fill_DRB_UEThpUl(__attribute__((unused)) const label_in
+ static meas_record_lst_t fill_RRU_PrbTotDl(__attribute__((unused)) const label_info_lst_t label,
+                                            __attribute__((unused)) uint32_t gran_period_ms,
+                                            cudu_ue_info_pair_t ue_info,
+-                                           const size_t ue_idx,
++                                           __attribute__((unused)) const size_t ue_idx,
+                                            e2_node_level_stats_t* node_stats)
+ {
+   meas_record_lst_t meas_record = {0};
+   
+   meas_record.value = INTEGER_MEAS_VALUE;
+ 
+-  // Get the number of DL PRBs
+-  const uint64_t tot_prb_dl_aggr = node_stats[1].mac_stats.dl.total_prb_aggregate - node_stats[0].mac_stats.dl.total_prb_aggregate;
+-  meas_record.int_val = (tot_prb_dl_aggr == 0) ? 0 : (ue_info.ue->mac_stats.dl.total_rbs - last_total_prbs[ue_idx].dl) * 100 / tot_prb_dl_aggr;   // [%]
+-  last_total_prbs[ue_idx].dl = ue_info.ue->mac_stats.dl.total_rbs;
++  // Get the number of DL PRBs of the UE (all its DRBs) over the cell's, since this subscription's previous report
++  drb_counters_t *last = get_drb_counters(ue_info.rrc_ue_id, ue_info.rb_id[0]);
++  if (!last->prb_set) {
++    last->total_prbs = (uldlcounter_t){.dl = ue_info.ue->mac_stats.dl.total_rbs, .ul = ue_info.ue->mac_stats.ul.total_rbs};
++    last->prb_aggregate_dl = node_stats[1].mac_stats.dl.total_prb_aggregate;
++    last->prb_aggregate_ul = node_stats[1].mac_stats.ul.total_prb_aggregate;
++    last->prb_set = true;
++  }
++  const uint64_t tot_prb_dl_aggr = node_stats[1].mac_stats.dl.total_prb_aggregate - last->prb_aggregate_dl;
++  meas_record.int_val = (tot_prb_dl_aggr == 0) ? 0 : (uint32_t)(ue_info.ue->mac_stats.dl.total_rbs - last->total_prbs.dl) * 100 / tot_prb_dl_aggr;   // [%]
++  last->total_prbs.dl = ue_info.ue->mac_stats.dl.total_rbs;
++  last->prb_aggregate_dl = node_stats[1].mac_stats.dl.total_prb_aggregate;
+ 
+   return meas_record;
+ }
+@@ -304,17 +379,25 @@ static meas_record_lst_t fill_RRU_PrbTotDl(__attribute__((unused)) const label_i
+ static meas_record_lst_t fill_RRU_PrbTotUl(__attribute__((unused)) const label_info_lst_t label,
+                                            __attribute__((unused)) uint32_t gran_period_ms,
+                                            cudu_ue_info_pair_t ue_info,
+-                                           const size_t ue_idx,
++                                           __attribute__((unused)) const size_t ue_idx,
+                                            e2_node_level_stats_t* node_stats)
+ {
+   meas_record_lst_t meas_record = {0};
+ 
+   meas_record.value = INTEGER_MEAS_VALUE;
+ 
+-  // Get the number of UL PRBs
+-  const uint64_t tot_prb_ul_aggr = node_stats[1].mac_stats.ul.total_prb_aggregate - node_stats[0].mac_stats.ul.total_prb_aggregate;
+-  meas_record.int_val = (tot_prb_ul_aggr == 0) ? 0 : (ue_info.ue->mac_stats.ul.total_rbs - last_total_prbs[ue_idx].ul) * 100 / tot_prb_ul_aggr;   // [%]
+-  last_total_prbs[ue_idx].ul = ue_info.ue->mac_stats.ul.total_rbs;
++  // Get the number of UL PRBs of the UE over the cell's, since this subscription's previous report
++  drb_counters_t *last = get_drb_counters(ue_info.rrc_ue_id, ue_info.rb_id[0]);
++  if (!last->prb_set) {
++    last->total_prbs = (uldlcounter_t){.dl = ue_info.ue->mac_stats.dl.total_rbs, .ul = ue_info.ue->mac_stats.ul.total_rbs};
++    last->prb_aggregate_dl = node_stats[1].mac_stats.dl.total_prb_aggregate;
++    last->prb_aggregate_ul = node_stats[1].mac_stats.ul.total_prb_aggregate;
++    last->prb_set = true;
++  }
++  const uint64_t tot_prb_ul_aggr = node_stats[1].mac_stats.ul.total_prb_aggregate - last->prb_aggregate_ul;
++  meas_record.int_val = (tot_prb_ul_aggr == 0) ? 0 : (uint32_t)(ue_info.ue->mac_stats.ul.total_rbs - last->total_prbs.ul) * 100 / tot_prb_ul_aggr;   // [%]
++  last->total_prbs.ul = ue_info.ue->mac_stats.ul.total_rbs;
++  last->prb_aggregate_ul = node_stats[1].mac_stats.ul.total_prb_aggregate;
+ 
+   return meas_record;
+ }
+diff --git a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm_subs.h b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm_subs.h
+index 14d1975c4e..d70342e6ee 100644
+--- a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm_subs.h
++++ b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_kpm_subs.h
+@@ -14,6 +14,11 @@
+ typedef struct {
+   uint32_t rrc_ue_id;
+   NR_UE_info_t* ue;
++  // DRBs of the subscribed S-NSSAI: a UE has one DRB per PDU session, possibly several in the same slice (e.g. the
++  // phone's default session and a service session); DRB-level measurements add up (or take the worst of) them
++#define KPM_MAX_DRB_PER_UE 8
++  int rb_id[KPM_MAX_DRB_PER_UE];
++  int n_rb;
+ 
+ } cudu_ue_info_pair_t;
+ 
+-- 
+2.43.0
+

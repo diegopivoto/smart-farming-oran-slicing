@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-farming-oran.local/schemas/run-manifest.schema.json",
+  "title": "Smart Farming O-RAN run manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "request_id",
+    "service_id",
+    "device_ref",
+    "initial_state",
+    "created_at_ns"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "format": "uuid"},
+    "request_id": {"type": "string", "format": "uuid"},
+    "service_id": {"enum": ["weather", "crop", "drone"]},
+    "device_ref": {"type": "string", "minLength": 1},
+    "initial_state": {"const": "requested"},
+    "created_at_ns": {"type": "integer", "minimum": 0},
+    "finalized_at_ns": {"type": "integer", "minimum": 0},
+    "finalization_reason": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": true
+}

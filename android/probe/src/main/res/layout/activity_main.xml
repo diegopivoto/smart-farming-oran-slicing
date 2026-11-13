@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <TextView
+        android:id="@+id/device"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="@color/muted"
+        android:textSize="12sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Request an extra cellular network (PDU session) per service. Capabilities are editable."
+        android:textColor="@color/text"
+        android:textSize="13sp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+        <Button android:id="@+id/btn_crop" style="@style/ServiceButton" android:text="crop · SD 000002" />
+        <EditText android:id="@+id/caps_crop" style="@style/CapsField" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+        <Button android:id="@+id/btn_drone" style="@style/ServiceButton" android:text="drone · SD 000003" />
+        <EditText android:id="@+id/caps_drone" style="@style/CapsField" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+        <Button android:id="@+id/btn_weather" style="@style/ServiceButton" android:text="weather · SD 000001" />
+        <EditText android:id="@+id/caps_weather" style="@style/CapsField" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+        <Button android:id="@+id/btn_release" style="@style/ActionButton" android:text="Release" />
+        <Button android:id="@+id/btn_retest" style="@style/ActionButton" android:text="Re-test" />
+        <Button android:id="@+id/btn_diag" style="@style/ActionButton" android:text="Diagnostics" />
+        <Button android:id="@+id/btn_clear" style="@style/ActionButton" android:text="Clear" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:background="@color/card"
+        android:elevation="2dp"
+        android:fontFamily="monospace"
+        android:padding="8dp"
+        android:textColor="@color/text"
+        android:textIsSelectable="true"
+        android:textSize="11sp" />
+
+    <ScrollView
+        android:id="@+id/log_scroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:layout_weight="1"
+        android:background="@color/log_bg"
+        android:padding="6dp">
+        <TextView
+            android:id="@+id/log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textColor="@color/log_text"
+            android:textIsSelectable="true"
+            android:textSize="11sp" />
+    </ScrollView>
+</LinearLayout>

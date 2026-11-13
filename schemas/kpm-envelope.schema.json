@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smartfarm.local/schemas/kpm-envelope.schema.json",
+  "title": "KPM telemetry envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "connection_epoch",
+    "sequence",
+    "collected_at_ns",
+    "e2_node_id",
+    "ue_id",
+    "measurements"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "connection_epoch": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "collected_at_ns": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "e2_node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ue_id": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "measurements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/KpmMeasurement"
+      }
+    }
+  },
+  "$defs": {
+    "KpmMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind",
+        "value",
+        "unit",
+        "supported",
+        "labels"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "integer",
+            "real",
+            "no_value"
+          ]
+        },
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "unit": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "supported": {
+          "type": "boolean"
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "no_value"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "integer"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "enum": [
+                  "DRB.PdcpSduVolumeDL",
+                  "DRB.RlcSduDelayDl",
+                  "DRB.UEThpDl",
+                  "RRU.PrbTotDl",
+                  "CARR.PDSCHMCSDist",
+                  "L1M.SS-RSRP",
+                  "MR.NRScSSSINR"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "supported": {
+                "const": true
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "supported": {
+                "const": false
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,53 @@
+[Unit]
+Description=Smart Farming FlexRIC near-RT RIC (read-only KPM gate)
+Documentation=file:/usr/local/share/doc/smartfarm/flexric-oai-kpm.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=inatel-crr
+Group=inatel-crr
+UMask=0027
+StateDirectory=smartfarm-flexric
+StateDirectoryMode=0750
+# The RIC stdout iApp writes SLICE/MAC/RLC stats to the relative path log.txt;
+# with ProtectSystem=strict and cwd=/ the open fails and the RIC dereferences NULL.
+WorkingDirectory=/var/lib/smartfarm-flexric
+ExecStart=/usr/local/bin/nearRT-RIC -c /usr/local/etc/flexric/flexric.conf -p /usr/local/lib/flexric/
+KillSignal=SIGINT
+TimeoutStopSec=20s
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=smartfarm-flexric
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+ReadWritePaths=/var/lib/smartfarm-flexric
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+SystemCallArchitectures=native
+RemoveIPC=true
+
+[Install]
+WantedBy=multi-user.target

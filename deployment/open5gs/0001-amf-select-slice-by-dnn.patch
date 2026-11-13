@@ -1,0 +1,145 @@
+diff --git a/src/amf/context.c b/src/amf/context.c
+index 69e90fd..e1a60e4 100644
+--- a/src/amf/context.c
++++ b/src/amf/context.c
+@@ -2869,6 +2869,67 @@ static bool gnb_ta_is_supported(
+ }
+ 
+ 
++/*
++ * Smart Farming lab policy (Open5GS has no URSP, so the UE cannot know which
++ * S-NSSAI serves a DNN): return the subscribed slice whose session DNN is
++ * `dnn` and that the UE's gNB supports in its TA, or NULL.
++ */
++ogs_slice_data_t *amf_smartfarm_slice_by_dnn(amf_ue_t *amf_ue, const char *dnn)
++{
++    amf_gnb_t *gnb = NULL;
++    ran_ue_t *ran_ue = NULL;
++    int i, k;
++
++    ogs_assert(amf_ue);
++    ogs_assert(dnn);
++
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue)
++        return NULL;
++    gnb = amf_gnb_find_by_id(ran_ue->gnb_id);
++    if (!gnb)
++        return NULL;
++
++    for (i = 0; i < amf_ue->num_of_slice && i < OGS_MAX_NUM_OF_SLICE; i++) {
++        ogs_slice_data_t *slice = &amf_ue->slice[i];
++
++        for (k = 0; k < slice->num_of_session && k < OGS_MAX_NUM_OF_SESS; k++) {
++            if (slice->session[k].name &&
++                !ogs_strcasecmp(dnn, slice->session[k].name) &&
++                gnb_ta_is_supported(gnb, &amf_ue->nr_tai.plmn_id,
++                    amf_ue->nr_tai.tac, &slice->s_nssai))
++                return slice;
++        }
++    }
++
++    return NULL;
++}
++
++/* Smart Farming lab policy: add `s_nssai` to the UE's Allowed NSSAI if missing */
++void amf_smartfarm_allow_s_nssai(amf_ue_t *amf_ue, ogs_s_nssai_t *s_nssai)
++{
++    int i, n;
++
++    ogs_assert(amf_ue);
++    ogs_assert(s_nssai);
++
++    n = amf_ue->allowed_nssai.num_of_s_nssai;
++    for (i = 0; i < n; i++) {
++        if (amf_ue->allowed_nssai.s_nssai[i].sst == s_nssai->sst &&
++            amf_ue->allowed_nssai.s_nssai[i].sd.v == s_nssai->sd.v)
++            return;
++    }
++    if (n >= OGS_MAX_NUM_OF_SLICE)
++        return;
++
++    memset(&amf_ue->allowed_nssai.s_nssai[n], 0,
++            sizeof(amf_ue->allowed_nssai.s_nssai[n]));
++    amf_ue->allowed_nssai.s_nssai[n].sst = s_nssai->sst;
++    amf_ue->allowed_nssai.s_nssai[n].sd.v = s_nssai->sd.v;
++    amf_ue->allowed_nssai.s_nssai[n].mapped_hplmn_sd.v = OGS_S_NSSAI_NO_SD_VALUE;
++    amf_ue->allowed_nssai.num_of_s_nssai++;
++}
++
+ bool amf_update_allowed_nssai(amf_ue_t *amf_ue)
+ {
+     int i, j, k;
+@@ -3019,6 +3080,24 @@ bool amf_update_allowed_nssai(amf_ue_t *amf_ue)
+         }
+     }
+ 
++    /*
++     * Smart Farming lab policy (no URSP/Configured NSSAI in this core): also
++     * allow every TA-supported subscribed S-NSSAI marked as default, so that a
++     * UE requesting only its old slice can still accept a PDU session that the
++     * AMF maps to another slice by DNN (see amf_smartfarm_slice_by_dnn).
++     */
++    if (amf_ue->allowed_nssai.num_of_s_nssai) {
++        for (i = 0; i < amf_ue->num_of_slice && i < OGS_MAX_NUM_OF_SLICE; i++) {
++            ogs_slice_data_t *slice = &amf_ue->slice[i];
++
++            if (slice->default_indicator == true &&
++                gnb_ta_is_supported(gnb,
++                    &amf_ue->nr_tai.plmn_id, amf_ue->nr_tai.tac,
++                    &slice->s_nssai) == true)
++                amf_smartfarm_allow_s_nssai(amf_ue, &slice->s_nssai);
++        }
++    }
++
+     if (!amf_ue->allowed_nssai.num_of_s_nssai) {
+         for (i = 0; i < amf_ue->num_of_slice; i++) {
+             ogs_slice_data_t *slice = &amf_ue->slice[i];
+diff --git a/src/amf/context.h b/src/amf/context.h
+index 6441449..b7264cd 100644
+--- a/src/amf/context.h
++++ b/src/amf/context.h
+@@ -1091,6 +1091,8 @@ void amf_ue_restore_memento(amf_ue_t *amf_ue, const amf_ue_memento_t *memento);
+ void amf_clear_subscribed_info(amf_ue_t *amf_ue);
+ 
+ bool amf_update_allowed_nssai(amf_ue_t *amf_ue);
++ogs_slice_data_t *amf_smartfarm_slice_by_dnn(amf_ue_t *amf_ue, const char *dnn);
++void amf_smartfarm_allow_s_nssai(amf_ue_t *amf_ue, ogs_s_nssai_t *s_nssai);
+ bool amf_ue_is_rat_restricted(amf_ue_t *amf_ue);
+ int amf_instance_get_load(void);
+ void amf_ue_save_to_release_session_list(amf_ue_t *amf_ue);
+diff --git a/src/amf/gmm-handler.c b/src/amf/gmm-handler.c
+index 30deb4c..5340131 100644
+--- a/src/amf/gmm-handler.c
++++ b/src/amf/gmm-handler.c
+@@ -1357,6 +1357,30 @@ int gmm_handle_ul_nas_transport(ran_ue_t *ran_ue, amf_ue_t *amf_ue,
+                 }
+             }
+ 
++            /*
++             * Smart Farming lab policy: the requested DNN is not served by the
++             * UE-provided S-NSSAI or its Allowed NSSAI. Select the subscribed
++             * slice that serves this DNN (TA-supported) and allow it.
++             */
++            if ((!selected_slice || !sess->dnn) &&
++                (ul_nas_transport->presencemask &
++                    OGS_NAS_5GS_UL_NAS_TRANSPORT_DNN_PRESENT)) {
++                ogs_slice_data_t *by_dnn =
++                    amf_smartfarm_slice_by_dnn(amf_ue, dnn->value);
++                if (by_dnn) {
++                    selected_slice = by_dnn;
++                    if (sess->dnn)
++                        ogs_free(sess->dnn);
++                    sess->dnn = ogs_strdup(dnn->value);
++                    ogs_assert(sess->dnn);
++                    amf_smartfarm_allow_s_nssai(amf_ue, &by_dnn->s_nssai);
++                    ogs_info("[%s] Smart Farming: DNN[%s] mapped to "
++                            "S_NSSAI[SST:%d SD:0x%x]", amf_ue->supi,
++                            sess->dnn, by_dnn->s_nssai.sst,
++                            by_dnn->s_nssai.sd.v);
++                }
++            }
++
+             if (!selected_slice || !sess->dnn) {
+                 ogs_warn("[%s] DNN Not Supported OR "
+                             "Not Subscribed in the Slice", amf_ue->supi);
