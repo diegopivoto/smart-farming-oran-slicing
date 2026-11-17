@@ -1,0 +1,77 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+android {
+    namespace 'br.inatel.smartfarm.farm'
+    compileSdk 34
+    buildToolsVersion '34.0.0'
+
+    defaultConfig {
+        applicationId 'br.inatel.smartfarm.pay'
+        minSdk 29
+        targetSdk 34
+        versionCode 25
+        versionName '2.3.1'
+    }
+
+    buildTypes {
+        // Non-debuggable, R8-optimized build signed with the same debug key: Compose and the 30 fps video run much
+        // faster than in the debuggable build. This is the APK to install on the phone.
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    buildFeatures {
+        compose true
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+        unitTests.includeAndroidResources = true // Robolectric screenshot renders (ScreenshotRender)
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // DLT slice market: secp256k1 keys, EIP-1559 signing and ABI encoding (JSON-RPC is done with HttpURLConnection)
+    implementation('org.web3j:core:4.8.8-android') { exclude group: 'org.java-websocket'; exclude group: 'com.squareup.okhttp3' }
+    def composeBom = platform('androidx.compose:compose-bom:2024.10.01')
+    implementation composeBom
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.foundation:foundation'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.animation:animation'
+    implementation 'androidx.activity:activity-compose:1.9.3'
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.8.7'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+    testImplementation 'org.robolectric:robolectric:4.13'
+    testImplementation 'androidx.compose.ui:ui-test-junit4'
+    debugImplementation 'androidx.compose.ui:ui-test-manifest'
+}

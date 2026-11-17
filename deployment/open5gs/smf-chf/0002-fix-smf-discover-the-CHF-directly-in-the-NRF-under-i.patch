@@ -1,0 +1,51 @@
+From 7ab50bcf30fd70b5517112a177fb02f7217113a5 Mon Sep 17 00:00:00 2001
+From: Diego Pivoto <>
+Date: Sat, 14 Nov 2026 15:54:38 -0300
+Subject: [PATCH 2/2] fix(smf): discover the CHF directly in the NRF under
+ indirect communication (SCP)
+
+With an SCP client the SMF has no NRF instance; the Nchf consumer now
+queries the NRF at SMF_NCHF_NRF_URI (default http://127.0.0.10:7777) and
+logs when no CHF is registered.
+---
+ src/smf/nchf-client.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/src/smf/nchf-client.c b/src/smf/nchf-client.c
+index 982bff0e8..0bb04172e 100644
+--- a/src/smf/nchf-client.c
++++ b/src/smf/nchf-client.c
+@@ -92,10 +92,17 @@ static bool discover_chf(void)
+ 
+     if (chf_uri[0] && ogs_time_now() < chf_uri_expiry) return true;
+     chf_uri[0] = 0;
+-    if (!nrf || !nrf->addr) return false;
+-    ogs_snprintf(uri, sizeof(uri),
+-        "http://%s:%d/nnrf-disc/v1/nf-instances?target-nf-type=CHF&requester-nf-type=SMF",
+-        OGS_ADDR(nrf->addr, addr), OGS_PORT(nrf->addr));
++    if (nrf && nrf->addr) {
++        ogs_snprintf(uri, sizeof(uri),
++            "http://%s:%d/nnrf-disc/v1/nf-instances?target-nf-type=CHF&requester-nf-type=SMF",
++            OGS_ADDR(nrf->addr, addr), OGS_PORT(nrf->addr));
++    } else {
++        /* indirect communication (SCP): the NRF is not configured in the SMF */
++        const char *base = getenv("SMF_NCHF_NRF_URI");
++        ogs_snprintf(uri, sizeof(uri),
++            "%s/nnrf-disc/v1/nf-instances?target-nf-type=CHF&requester-nf-type=SMF",
++            base ? base : "http://127.0.0.10:7777");
++    }
+     status = h2_request("GET", uri, NULL, &res, NULL, 0);
+     if (status == 200 && res && (root = cJSON_Parse(res))) {
+         cJSON *v = cJSON_GetObjectItem(root, "validityPeriod");
+@@ -119,6 +126,8 @@ static bool discover_chf(void)
+     if (chf_uri[0]) {
+         chf_uri_expiry = ogs_time_now() + ogs_time_from_sec(validity);
+         ogs_info("[CHF] discovered via NRF: %s", chf_uri);
++    } else {
++        ogs_info("[CHF] no CHF registered in the NRF (HTTP %ld): offline charging", status);
+     }
+     return chf_uri[0] != 0;
+ }
+-- 
+2.43.0
+

@@ -668,6 +668,7 @@ class DemoApi:
         self._dry_run = dry_run
         self._oran = oran
         self._agent = agent
+        self._wallet: Any = None
 
     def _with_oran(self, view: dict[str, Any]) -> dict[str, Any]:
         """Add the read-only `oran` object to an active session's view (absent without a monitor or when inactive)."""
@@ -704,6 +705,8 @@ class DemoApi:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     return 400, {"error": "body must be JSON"}
                 return await self.orchestrator.submit(payload, client)
+            if path.startswith("/api/v1/wallet/"):
+                return await self._wallet_route(method, path, target, body)
             if path == "/api/v1/oran":
                 if method != "GET":
                     return 405, {"error": "GET only"}
@@ -734,6 +737,31 @@ class DemoApi:
             return 404, {"error": "not found"}
         except RequestError as error:
             return error.status, {"error": error.message}
+
+    async def _wallet_route(self, method: str, path: str, target: str, body: bytes) -> tuple[int, Any]:
+        """DLT slice market endpoints (wallet.py); 404 when the market is not configured."""
+
+        if self._wallet is None:
+            try:
+                from smartfarm.orchestrator.wallet import WalletGateway
+                self._wallet = await asyncio.to_thread(WalletGateway)
+            except Exception as error:  # noqa: BLE001
+                return 404, {"error": f"DLT slice market not configured: {error}"}
+        query = parse_qs(urlsplit(target).query)
+        try:
+            if path == "/api/v1/wallet/quote" and method == "GET":
+                return await asyncio.to_thread(self._wallet.quote, query.get("service", [""])[0],
+                                               query.get("adaptive", ["0"])[0] in ("1", "true"))
+            if path == "/api/v1/wallet/rpc" and method == "POST":
+                return await asyncio.to_thread(self._wallet.rpc, body)
+            if path == "/api/v1/wallet/status" and method == "GET":
+                address = query.get("address", [None])[0]
+                if address:  # lets dlt/scripts/fund.js --app find the app wallet
+                    self._log.write("wallet_status", echo=False, path=f"wallet/status?address={address}")
+                return await asyncio.to_thread(self._wallet.status, address)
+        except Exception as error:  # noqa: BLE001 - chain or CHF unreachable
+            return 502, {"error": f"DLT gateway: {error}"}
+        return 404, {"error": "not found"}
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         started = time.monotonic()

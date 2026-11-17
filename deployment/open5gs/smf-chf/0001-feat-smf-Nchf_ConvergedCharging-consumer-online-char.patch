@@ -1,0 +1,349 @@
+From 19bb64a28114efb1307085df702a0c46b9e4ca6a Mon Sep 17 00:00:00 2001
+From: Diego Pivoto <>
+Date: Sat, 14 Nov 2026 14:23:02 -0300
+Subject: [PATCH 1/2] feat(smf): Nchf_ConvergedCharging consumer (online
+ charging before the PDU session)
+
+The SMF discovers the CHF through the NRF (target-nf-type=CHF) and sends a
+ChargingDataRequest (SUPI, PDU session id, DNN, S-NSSAI, charging id) right
+after the SM policy association; the PDU session is rejected when the CHF
+does not grant the quota. The ChargingDataRef from the Location header is
+released when the session is removed. Without a registered CHF the SMF
+works as before (offline mode).
+---
+ src/smf/context.c     |   3 +
+ src/smf/context.h     |   1 +
+ src/smf/gsm-sm.c      |   5 +
+ src/smf/meson.build   |   1 +
+ src/smf/nchf-client.c | 218 ++++++++++++++++++++++++++++++++++++++++++
+ src/smf/nchf-client.h |  25 +++++
+ 6 files changed, 253 insertions(+)
+ create mode 100644 src/smf/nchf-client.c
+ create mode 100644 src/smf/nchf-client.h
+
+diff --git a/src/smf/context.c b/src/smf/context.c
+index 0686a4fee..57c5eac85 100644
+--- a/src/smf/context.c
++++ b/src/smf/context.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "context.h"
++#include "nchf-client.h"
+ #include "gtp-path.h"
+ #include "pfcp-path.h"
+ 
+@@ -1688,6 +1689,8 @@ void smf_sess_remove(smf_sess_t *sess)
+ 
+     ogs_assert(sess);
+     smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
++
++    smf_nchf_charging_release(sess);
+     ogs_assert(smf_ue);
+ 
+     ogs_info("Removed Session: UE IMSI:[%s] DNN:[%s:%d] IPv4:[%s] IPv6:[%s]",
+diff --git a/src/smf/context.h b/src/smf/context.h
+index b43fc6b84..64036a18c 100644
+--- a/src/smf/context.h
++++ b/src/smf/context.h
+@@ -486,6 +486,7 @@ typedef struct smf_sess_s {
+     struct {
+         uint32_t id;
+     } charging;
++    char *chf_charging_ref;     /* Nchf_ConvergedCharging ChargingDataRef */
+ 
+     /* AAA Node Identifier */
+     struct {
+diff --git a/src/smf/gsm-sm.c b/src/smf/gsm-sm.c
+index f9fa59580..99e05dc53 100644
+--- a/src/smf/gsm-sm.c
++++ b/src/smf/gsm-sm.c
+@@ -19,6 +19,7 @@
+ 
+ #include "binding.h"
+ #include "sbi-path.h"
++#include "nchf-client.h"
+ #include "gn-handler.h"
+ #include "gx-handler.h"
+ #include "gy-handler.h"
+@@ -622,6 +623,10 @@ void smf_gsm_state_wait_5gc_sm_policy_association(ogs_fsm_t *s, smf_event_t *e)
+                             smf_ue->supi, sess->psi,
+                             sbi_message->res_status);
+                     OGS_FSM_TRAN(s, smf_gsm_state_5gc_n1_n2_reject);
++                } else if (smf_nchf_charging_create(sess) == false) {
++                    ogs_error("[%s:%d] CHF did not grant a charging quota",
++                            smf_ue->supi, sess->psi);
++                    OGS_FSM_TRAN(s, smf_gsm_state_5gc_n1_n2_reject);
+                 } else if (smf_npcf_smpolicycontrol_handle_create(
+                         sess, state, sbi_message) == true) {
+                     OGS_FSM_TRAN(s,
+diff --git a/src/smf/meson.build b/src/smf/meson.build
+index 12599f3bc..1caaad8c4 100644
+--- a/src/smf/meson.build
++++ b/src/smf/meson.build
+@@ -106,6 +106,7 @@ libsmf_sources = files('''
+     ngap-handler.c
+     ngap-path.c
+     metrics.c
++    nchf-client.c
+ '''.split())
+ 
+ libsmf = static_library('smf',
+diff --git a/src/smf/nchf-client.c b/src/smf/nchf-client.c
+new file mode 100644
+index 000000000..982bff0e8
+--- /dev/null
++++ b/src/smf/nchf-client.c
+@@ -0,0 +1,218 @@
++/*
++ * Nchf_ConvergedCharging consumer of the SMF (Smart Farming DLT slice market).
++ *
++ * The CHF runs on the same host, so the exchange is a short synchronous
++ * HTTP/2 (h2c) request over libcurl, the transport already used by lib/sbi.
++ * Discovery: Nnrf_NFDiscovery with target-nf-type=CHF, cached for the
++ * validityPeriod returned by the NRF.
++ */
++#include <curl/curl.h>
++
++#include "nchf-client.h"
++
++#define CHF_TIMEOUT_MS 3000
++
++static char chf_uri[256];
++static ogs_time_t chf_uri_expiry;
++
++typedef struct { char *buf; size_t len; } body_t;
++
++static size_t on_body(void *p, size_t size, size_t n, void *ud)
++{
++    body_t *b = ud;
++    size_t add = size * n;
++    char *nb = ogs_realloc(b->buf, b->len + add + 1);
++    if (!nb) return 0;
++    b->buf = nb;
++    memcpy(b->buf + b->len, p, add);
++    b->len += add;
++    b->buf[b->len] = 0;
++    return add;
++}
++
++typedef struct { char *dst; size_t len; } loc_t;
++
++static size_t on_header(char *p, size_t size, size_t n, void *ud)
++{
++    loc_t *l = ud;
++    size_t len = size * n;
++    if (l->dst && len > 9 && strncasecmp(p, "location:", 9) == 0) {
++        size_t i = 9, j = len;
++        while (i < len && p[i] == ' ') i++;
++        while (j > i && (p[j - 1] == '\r' || p[j - 1] == '\n')) j--;
++        if (j - i >= l->len) j = i + l->len - 1;
++        memcpy(l->dst, p + i, j - i);
++        l->dst[j - i] = 0;
++    }
++    return len;
++}
++
++/* returns the HTTP status (0 on transport error); *out must be freed */
++static long h2_request(const char *method, const char *uri,
++        const char *json, char **out, char *location, size_t location_len)
++{
++    CURL *c = curl_easy_init();
++    struct curl_slist *h = NULL;
++    body_t b = { NULL, 0 };
++    long status = 0;
++    loc_t l = { location, location_len };
++
++    if (!c) return 0;
++    curl_easy_setopt(c, CURLOPT_URL, uri);
++    curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE);
++    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method);
++    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, CHF_TIMEOUT_MS);
++    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_body);
++    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
++    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, on_header);
++    curl_easy_setopt(c, CURLOPT_HEADERDATA, &l);
++    h = curl_slist_append(h, "Accept: application/json, application/problem+json");
++    if (json) {
++        h = curl_slist_append(h, "Content-Type: application/json");
++        curl_easy_setopt(c, CURLOPT_POSTFIELDS, json);
++    }
++    curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
++    if (curl_easy_perform(c) == CURLE_OK) {
++        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
++    }
++    curl_slist_free_all(h);
++    curl_easy_cleanup(c);
++    if (out) *out = b.buf; else if (b.buf) ogs_free(b.buf);
++    return status;
++}
++
++/* Nnrf_NFDiscovery for the CHF; returns false when no CHF is registered */
++static bool discover_chf(void)
++{
++    ogs_sbi_client_t *nrf = NF_INSTANCE_CLIENT(ogs_sbi_self()->nrf_instance);
++    char uri[256], addr[OGS_ADDRSTRLEN], *res = NULL;
++    cJSON *root = NULL, *list, *inst, *ep;
++    long status;
++    int validity = 30;
++
++    if (chf_uri[0] && ogs_time_now() < chf_uri_expiry) return true;
++    chf_uri[0] = 0;
++    if (!nrf || !nrf->addr) return false;
++    ogs_snprintf(uri, sizeof(uri),
++        "http://%s:%d/nnrf-disc/v1/nf-instances?target-nf-type=CHF&requester-nf-type=SMF",
++        OGS_ADDR(nrf->addr, addr), OGS_PORT(nrf->addr));
++    status = h2_request("GET", uri, NULL, &res, NULL, 0);
++    if (status == 200 && res && (root = cJSON_Parse(res))) {
++        cJSON *v = cJSON_GetObjectItem(root, "validityPeriod");
++        if (cJSON_IsNumber(v)) validity = v->valueint;
++        list = cJSON_GetObjectItem(root, "nfInstances");
++        inst = cJSON_IsArray(list) ? cJSON_GetArrayItem(list, 0) : NULL;
++        if (inst) {
++            cJSON *svcs = cJSON_GetObjectItem(inst, "nfServices");
++            cJSON *svc = cJSON_IsArray(svcs) ? cJSON_GetArrayItem(svcs, 0) : NULL;
++            cJSON *eps = svc ? cJSON_GetObjectItem(svc, "ipEndPoints") : NULL;
++            ep = cJSON_IsArray(eps) ? cJSON_GetArrayItem(eps, 0) : NULL;
++            cJSON *ip = ep ? cJSON_GetObjectItem(ep, "ipv4Address") : NULL;
++            cJSON *port = ep ? cJSON_GetObjectItem(ep, "port") : NULL;
++            if (cJSON_IsString(ip))
++                ogs_snprintf(chf_uri, sizeof(chf_uri), "http://%s:%d/nchf-convergedcharging/v3",
++                        ip->valuestring, cJSON_IsNumber(port) ? port->valueint : 80);
++        }
++    }
++    if (root) cJSON_Delete(root);
++    if (res) ogs_free(res);
++    if (chf_uri[0]) {
++        chf_uri_expiry = ogs_time_now() + ogs_time_from_sec(validity);
++        ogs_info("[CHF] discovered via NRF: %s", chf_uri);
++    }
++    return chf_uri[0] != 0;
++}
++
++static char *build_request(smf_sess_t *sess, smf_ue_t *smf_ue, const char *usage)
++{
++    char sd[8], ts[64];
++    char *json;
++    cJSON *r = cJSON_CreateObject(), *cons, *pdu, *info, *nssai, *mu;
++    time_t now = time(NULL);
++
++    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
++    cJSON_AddStringToObject(r, "subscriberIdentifier", smf_ue->supi);
++    cons = cJSON_AddObjectToObject(r, "nfConsumerIdentification");
++    cJSON_AddStringToObject(cons, "nodeFunctionality", "SMF");
++    cJSON_AddStringToObject(cons, "nFName", ogs_sbi_self()->nf_instance->id);
++    cJSON_AddStringToObject(r, "invocationTimeStamp", ts);
++    cJSON_AddNumberToObject(r, "invocationSequenceNumber", 0);
++    cJSON_AddNumberToObject(r, "chargingId", sess->charging.id);
++    mu = cJSON_AddArrayToObject(r, "multipleUnitUsage");
++    if (usage) {
++        cJSON *u = cJSON_CreateObject();
++        cJSON_AddStringToObject(u, "usage", usage);
++        cJSON_AddItemToArray(mu, u);
++    }
++    pdu = cJSON_AddObjectToObject(r, "pDUSessionChargingInformation");
++    cJSON_AddNumberToObject(pdu, "chargingId", sess->charging.id);
++    info = cJSON_AddObjectToObject(pdu, "pduSessionInformation");
++    cJSON_AddNumberToObject(info, "pduSessionID", sess->psi);
++    cJSON_AddStringToObject(info, "dnnId", sess->session.name ? sess->session.name : "");
++    nssai = cJSON_AddObjectToObject(cJSON_AddObjectToObject(info, "networkSlicingInfo"), "sNSSAI");
++    cJSON_AddNumberToObject(nssai, "sst", sess->s_nssai.sst);
++    if (sess->s_nssai.sd.v != OGS_S_NSSAI_NO_SD_VALUE) {
++        ogs_snprintf(sd, sizeof(sd), "%06x", sess->s_nssai.sd.v);
++        cJSON_AddStringToObject(nssai, "sd", sd);
++    }
++    json = cJSON_PrintUnformatted(r);
++    cJSON_Delete(r);
++    return json;
++}
++
++bool smf_nchf_charging_create(smf_sess_t *sess)
++{
++    smf_ue_t *smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
++    char uri[320], location[320] = "", *json, *res = NULL;
++    long status;
++    bool granted = false;
++    cJSON *root = NULL;
++
++    if (!smf_ue || !discover_chf()) return true;    /* no CHF: offline mode */
++    json = build_request(sess, smf_ue, NULL);
++    ogs_snprintf(uri, sizeof(uri), "%s/chargingdata", chf_uri);
++    status = h2_request("POST", uri, json, &res, location, sizeof(location));
++    cJSON_free(json);
++    if (status == 201 && res && (root = cJSON_Parse(res))) {
++        cJSON *mui = cJSON_GetObjectItem(root, "multipleUnitInformation");
++        cJSON *u = cJSON_IsArray(mui) ? cJSON_GetArrayItem(mui, 0) : NULL;
++        cJSON *rc = u ? cJSON_GetObjectItem(u, "resultCode") : NULL;
++        granted = cJSON_IsString(rc) && strcmp(rc->valuestring, "SUCCESS") == 0;
++        if (granted && location[0]) {
++            const char *ref = strrchr(location, '/');
++            if (sess->chf_charging_ref) ogs_free(sess->chf_charging_ref);
++            sess->chf_charging_ref = ogs_strdup(ref ? ref + 1 : location);
++        }
++        ogs_info("[CHF] %s PSI %d DNN %s: %s (ref %s)", smf_ue->supi, sess->psi,
++                sess->session.name, cJSON_IsString(rc) ? rc->valuestring : "?",
++                sess->chf_charging_ref ? sess->chf_charging_ref : "-");
++    } else if (status == 0) {
++        chf_uri[0] = 0;
++        ogs_warn("[CHF] unreachable, PDU session allowed without charging");
++        granted = true;
++    } else {
++        ogs_warn("[CHF] %s PSI %d DNN %s denied (HTTP %ld)", smf_ue->supi, sess->psi,
++                sess->session.name, status);
++    }
++    if (root) cJSON_Delete(root);
++    if (res) ogs_free(res);
++    return granted;
++}
++
++void smf_nchf_charging_release(smf_sess_t *sess)
++{
++    smf_ue_t *smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
++    char uri[384], *json;
++    long status;
++
++    if (!sess->chf_charging_ref) return;
++    if (smf_ue && discover_chf()) {
++        json = build_request(sess, smf_ue, "release");
++        ogs_snprintf(uri, sizeof(uri), "%s/chargingdata/%s/release", chf_uri, sess->chf_charging_ref);
++        status = h2_request("POST", uri, json, NULL, NULL, 0);
++        cJSON_free(json);
++        ogs_info("[CHF] release %s ref %s: HTTP %ld", smf_ue->supi, sess->chf_charging_ref, status);
++    }
++    ogs_free(sess->chf_charging_ref);
++    sess->chf_charging_ref = NULL;
++}
+diff --git a/src/smf/nchf-client.h b/src/smf/nchf-client.h
+new file mode 100644
+index 000000000..9bd143224
+--- /dev/null
++++ b/src/smf/nchf-client.h
+@@ -0,0 +1,25 @@
++/*
++ * Nchf_ConvergedCharging consumer of the SMF (CTF role, TS 32.290/32.291).
++ * Smart Farming DLT slice market: the CHF is discovered through the NRF
++ * (target-nf-type=CHF). Online charging is enforced when a CHF is registered:
++ * a PDU session is only established after the CHF grants a quota.
++ */
++#ifndef SMF_NCHF_CLIENT_H
++#define SMF_NCHF_CLIENT_H
++
++#include "context.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* true: quota granted (or no CHF registered); false: CHF denied the session */
++bool smf_nchf_charging_create(smf_sess_t *sess);
++/* closes the charging session (CDR) of a released PDU session, if any */
++void smf_nchf_charging_release(smf_sess_t *sess);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+-- 
+2.43.0
+

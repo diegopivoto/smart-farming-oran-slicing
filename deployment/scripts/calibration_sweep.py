@@ -24,6 +24,7 @@ and every resume is logged as a `resume` event. Cells listed in <out>/invalidate
 import argparse
 import asyncio
 import json
+import os
 import random
 import statistics
 import subprocess
@@ -51,7 +52,9 @@ from analyze_calibration import read_cells  # noqa: E402
 from traffic_run import COLLECTED, evaluate  # noqa: E402
 
 SOCKET = Path("/run/user/1000/smartfarm-sf.sock")
-LA_DEFAULT_RB = 132  # BS default UL reservation (full band) restored before every release
+# BS default UL reservation restored before every release: full band (132) in the O-RAN paper; the DLT slice market
+# work uses SF_LA_DEFAULT_RB=33 (one TV channel) as the RAN default of a subscriber without a purchased slice
+LA_DEFAULT_RB = int(os.environ.get("SF_LA_DEFAULT_RB", "132"))
 UN3GPP_CLOCK_OFFSET_NS = 0  # BS (PC2) clock minus PC1 clock; UL actions are stamped in the BS clock (measure_pc2_offset)
 
 
@@ -221,10 +224,13 @@ class Sweep:
             return False, f"un3gpp in SD {status.sd}, service slice is SD {profile.snssai.sd}"
         if phone.dnn != profile.handset_dnn:
             return False, f"phone on DNN {phone.dnn}, service DNN is {profile.handset_dnn}"
-        ping = subprocess.run(("ping", "-n", "-q", "-c", "2", "-W", "1", str(phone.ipv4)), capture_output=True,
-                              text=True, check=False)
-        if " 0 received" in ping.stdout:
-            return False, f"phone {phone.ipv4} not answering"
+        # SF_SKIP_PHONE_PING=1: the handset drops ICMP (seen 2026-11-14); the session/DNN checks above still apply and
+        # the service traffic of the step proves reachability
+        if os.environ.get("SF_SKIP_PHONE_PING") != "1":
+            ping = subprocess.run(("ping", "-n", "-q", "-c", "2", "-W", "1", str(phone.ipv4)), capture_output=True,
+                                  text=True, check=False)
+            if " 0 received" in ping.stdout:
+                return False, f"phone {phone.ipv4} not answering"
         return True, f"un3gpp {status.ipv4} SD {status.sd}; phone {phone.ipv4} {phone.dnn}"
 
     async def recover(self) -> bool:

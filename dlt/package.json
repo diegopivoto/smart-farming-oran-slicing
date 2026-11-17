@@ -1,0 +1,17 @@
+{
+  "name": "smartfarm-dlt-slice-market",
+  "private": true,
+  "description": "Slice marketplace on Ethereum (Sepolia) used as the account balance ledger of the 5G CHF",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "node": "hardhat node"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.0.8",
+    "@nomicfoundation/hardhat-ethers": "^3.0.8",
+    "chai": "^4.5.0",
+    "ethers": "^6.13.4",
+    "hardhat": "^2.22.17"
+  }
+}

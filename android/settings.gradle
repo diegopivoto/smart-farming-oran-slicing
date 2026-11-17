@@ -15,3 +15,4 @@ dependencyResolutionManagement {
 rootProject.name = "SmartFarmAndroid"
 include ":app"    // Smart Farm demo app (Kotlin + Compose)
 include ":probe"  // phase-1 capability probe (Java + Views)
+include ":pay"    // Smart Farm Pay: DLT slice market (payment before the slice switch, wallet)
