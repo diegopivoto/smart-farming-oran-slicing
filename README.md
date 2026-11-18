@@ -38,12 +38,16 @@ read-back.
 
 ## Dataset and trained model
 
-The measured dataset (calibration cells, online sessions and the trained DDQN models) is attached to the GitHub release
-of this repository as `smart-farming-oran-experiments-20261105.tar.zst`, together with the Android app APK. Extract it at
-the repository root:
+The measured dataset (raw and processed data of the 864 calibration trials, the online sessions, the offline training
+runs and the trained DDQN models, with the raw journals of the RIC, KPM bridge and control xApp and the core and UE
+logs) is attached to the GitHub release
+[v1.1](https://github.com/diegopivoto/smart-farming-oran-slicing/releases/tag/v1.1) as
+`smart-farming-oran-dataset-20261105-v1.1.tar.zst`, together with the Android app APK. `experiments/README.md` inside
+the archive maps each result of the paper to its run directory. The test SIM identities are masked in the logs and the
+IPsec session keys are redacted; no measurement value was changed. Extract it at the repository root:
 
 ```bash
-zstd -dc smart-farming-oran-experiments-20261105.tar.zst | tar -xf -
+zstd -dc smart-farming-oran-dataset-20261105-v1.1.tar.zst | tar -xf -
 ```
 
 ## Quick start (software only)
